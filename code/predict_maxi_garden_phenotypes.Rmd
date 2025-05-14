@@ -1,0 +1,516 @@
+---
+title: "Predict height in maxis"
+author: "Alayna Mead"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    toc: true
+    number_sections: true
+    highlight: rstudio
+---
+
+Test whether model built from mini gardens dataset can accurately predict growth in the maxi gardens (3 sites, one of which is novel, and 544 genotypes, 500 of which are novel)
+
+This code is mostly pulled from 'code/transfer_function_multiyear_linear_mixed_effects_model.Rmd' script
+
+# Setup
+
+## packages and data
+
+```{r setup}
+
+library(ggplot2)
+library(sjPlot) # nice plots of models
+library(glmmTMB) #zero-inflated  model and also used with sjPlot
+library(bbmle) # for AICtab
+
+# maxi garden data - named 'maxis'
+load('data/clean/maxi_garden_phenotypic_climate_genetic_data_2021-2023.Rdata')
+str(maxis)
+
+# load model info
+# mod: model
+# df.scaled: scaled mini garden data that went into the model
+# scaling_factor: used to scale variables before fitting model
+load('results/model_prediction/glmTMB_multiyear_model_outputs_garden_MCMT_2021-2022_vs_GrowthIncrement_2021-2022.Rda')
+
+```
+
+```{r markdown_settings}
+
+knitr::opts_chunk$set(fig.width = 10, fig.height = 10)
+
+```
+
+```{r compare_datasets}
+
+# which genotypes are in maxis but not minis?
+genoMinis <- unique(df.scaled$genotype)
+genoMaxis <- unique(maxis$TAG)
+
+
+length(genoMinis)
+length(genoMaxis)
+
+sum(! genoMaxis %in% genoMinis) # 500
+
+```
+
+# clean up data
+
+## change ND name
+```{r cleanup_ND}
+
+# rename ND to NDSU to match mini garden dataset
+maxis$garden <- gsub('ND', 'NDSU', maxis$garden)
+
+
+```
+
+Cleanup using same methods as in model fitting script 'code/transfer_function_linear_mixed_effects_model.Rmd'
+
+
+## set dead to 0
+
+```{r cleanup_set_dead_to_0}
+
+# dead trees should have a growth of zero if they were dead the whole year
+# some trees died during the season - keep these growth values since it's real growth and should be related to fitness
+
+# change these growth values from NA to 0
+par(mfrow = c(1,2))
+hist(maxis$GrowthIncrement_2021)
+maxis[which(maxis$LIVE_Y_N_2021 == 0 & is.na(maxis$GrowthIncrement_2021)), 'GrowthIncrement_2021'] <- 0
+hist(maxis$GrowthIncrement_2021)
+
+hist(maxis$GrowthIncrement_2022)
+maxis[which(maxis$LIVE_Y_N_2022 == 0 & is.na(maxis$GrowthIncrement_2022)), 'GrowthIncrement_2022'] <- 0
+hist(maxis$GrowthIncrement_2022)
+
+# save a list of which trees are alive each year
+# used later to exclude dead trees when evaluating conditional model
+alive21 <- rownames(maxis)[maxis$LIVE_Y_N_2021 == 1]
+alive22 <- rownames(maxis)[maxis$LIVE_Y_N_2022 == 1]
+
+
+```
+
+```{r cleanup_remove_dead, eval = F, include = F}
+
+# remove trees that were dead at the end of 2021
+# need to modify this if using across multiple years
+dim(maxis)
+maxis <- maxis[which(maxis$LIVE_Y_N_2021 == 1),]
+dim(maxis)
+
+```
+
+## remove negative heights
+
+```{r cleanup_remove_negative_heights}
+
+# remove negative heights - these are either measurement error or being eaten
+
+# 2021
+hist(maxis$GrowthIncrement_2021)
+sum(maxis$GrowthIncrement_2021 < 0, na.rm = T) # 65
+
+maxis[which(maxis$GrowthIncrement_2021 <0), 'GrowthIncrement_2021'] <- NA
+
+# 2022
+hist(maxis$GrowthIncrement_2022)
+sum(maxis$GrowthIncrement_2022 < 0, na.rm = T) # 47
+
+maxis[which(maxis$GrowthIncrement_2022 <0), 'GrowthIncrement_2022'] <- NA
+
+# 2023
+hist(maxis$GrowthIncrement_2023)
+sum(maxis$GrowthIncrement_2023 < 0, na.rm = T) # 50
+
+maxis[which(maxis$GrowthIncrement_2023 <0), 'GrowthIncrement_2023'] <- NA
+
+
+# check
+hist(maxis$GrowthIncrement_2021)
+hist(maxis$GrowthIncrement_2022)
+hist(maxis$GrowthIncrement_2023)
+
+```
+
+# Set up model
+
+## choose model variables
+
+Use MCMT as climate variable
+
+```{r setup_choose_model_variables}
+
+# MCMT vs height
+
+# climate
+garden_clim_colname <- 'garden_MCMT_2021'
+home_clim_colname <- 'provenance_MCMT_1961_1990'
+clim_label <- 'MCMT'
+
+# phenotype
+pheno_colname <- 'GrowthIncrement_2021'
+pheno_label <- 'Growth Increment 2021'
+
+###############################################
+
+# setup variables and put into a dataframe
+
+# set climate and phenotype variables
+garden_clim <- maxis[,garden_clim_colname]
+garden_clim_2 <- maxis[,garden_clim_colname]^2
+home_clim <- maxis[,home_clim_colname]
+home_clim_2 <- maxis[,home_clim_colname]^2
+pheno <- maxis[,pheno_colname]
+
+# random effects
+
+# need to edit block so the VA and ND gardens don't have same block names?
+# add 'maxi' to block name to distinguish from the NDSU and VA mini gardens blocks
+# otherwise the same random effect will be applied even though they are actually different blocks
+block <- paste('maxi', as.character(interaction(maxis$garden, maxis$BLOCK, drop = T)), sep = '.')
+
+Pt <- maxis$k2_tricho
+genotype <- as.character(maxis$TAG)
+garden <- as.character(maxis$garden)
+pc1 <- maxis$genetic_PC1
+pc2 <- maxis$genetic_PC2
+pc3 <- maxis$genetic_PC3
+pc4 <- maxis$genetic_PC4
+pc5 <- maxis$genetic_PC5
+
+# put in df
+df <- data.frame(pheno, garden_clim, garden_clim_2, home_clim, home_clim_2, Pt, genotype, garden, block, pc1, pc2, pc3, pc4, pc5)
+rownames(df) <- rownames(maxis)
+
+# add year and individual
+df$year <- 2021
+df$indiv <- rownames(maxis)
+
+str(df)
+
+
+```
+
+## scale variables
+
+```{r setup_scale}
+
+# subset to the variables that were used in original model
+# get variables that were put into model
+# variables have to be named the same in this script as in 'choose_model_variables' chunk
+vars <- colnames(mod$frame)
+# rename response variable
+vars[1] <- 'pheno'
+
+df <- df[,vars]
+str(df)
+
+
+# scale using scaling factors
+# go through each column and check if it exists in scaling_factor
+# skips non-numeric columns
+
+df.scaled <- df
+
+for(n in 1:ncol(df)){
+  
+  if(colnames(df)[n] %in% names(scaling_factor)){
+    # to scale, multiply by scaling factor
+    df.scaled[,n] <- df.scaled[,n] * as.numeric(scaling_factor[colnames(df)[n]])
+  }
+}
+
+head(df.scaled)  
+
+
+```
+
+# Predict growth and mortality from model
+
+## Functions
+
+```{r functions}
+
+# modified from 'code/transfer_function_linear_mixed_effects_model.Rmd'
+
+# function to calculate correlation between predicted and observed values for a model (essentially the R value)
+
+# mod is the model
+# it pulls the dataset from the model object, which allows us to remove rows with NAs for just the variables used in this model
+# re.form argument goes to predict(); to include random effects set to NULL, to set random effects to zero set to NA
+
+model_R <- function(mod, newdata, type = 'response', re.form = NULL, se.fit = FALSE){
+  
+  # setup
+  # include random effects in predictions or set random effects to zero?
+  # this is the re.form argument in predict()
+  #re.form <- ifelse(include_REs == TRUE, eval(NULL), NA)
+  
+  df <- newdata
+  
+  # make new dataframe with no NA values
+  noNA <- df[complete.cases(df),]
+
+  
+  # predict phenotype (generally height)
+  noNA$pred <- predict(mod, newdata = noNA, type = type, re.form = re.form, se.fit = se.fit)
+  
+  # un-log-transform
+  noNA$pred <- exp(noNA$pred) - 1
+  
+  # if type = conditional, remove dead trees (which are modeled separately in zero-inflated model)
+  if(type == 'conditional'){
+    noNA <- noNA[alive21,]
+  }
+  
+  # calculate correlation
+  cor <- cor.test(noNA$pheno, noNA$pred)
+  
+  return(list(actual = noNA$pheno, predicted = noNA$pred, cor = cor, data_noNAs = noNA))
+  
+}
+
+# test
+# cor <- model_R(mod, re.form = NULL)
+
+# plot which takes output of model_R
+
+plot_predicted_vs_actual <- function(input, title = NULL, col = rgb(0,0,0,0.1), col_1to1 = 'red', col_fit = 'blue', legend = TRUE){
+  
+  pval <- round(input$cor$p.value, 4)
+  cor_est <- as.numeric(round(input$cor$estimate, 3))
+  main <- paste(title, '\n', 'R = ', cor_est, ' | p = ', pval, sep = '')
+  
+  plot(input$actual, input$predicted, 
+       pch = 16, 
+       col = col, 
+       xlab = "Actual growth increment (cm)", 
+       ylab = "Predicted growth increment (cm)",
+       title(main, adj = 0))
+  abline(0, 1, col = col_1to1, lty = 2) # 1to1 line
+  abline(lm(input$predicted ~ input$actual), col = col_fit) # fit line
+  
+  # add text
+  if(legend == TRUE){
+    legend('bottomright', fill = c(col_1to1, col_fit), legend = c('1:1 line', 'Best fit'))
+  }
+}
+
+
+
+```
+
+
+## Predict for maxi garden data
+
+```{r predict, warning = FALSE}
+
+# predict growth increment for each tree in maxi gardens, based on genetic PCs, home climate, and garden climate, and compare predictions to actual values
+
+# see ?predict.glmmTMB
+
+# This will give a warning about new random effects, because some genotypes and gardens were not included in training dataset (mini gardens)
+
+# Warning messages:
+# 1: In checkTerms(data.tmb1$terms, data.tmb0$terms) :
+#   Predicting new random effect levels for terms: 1 | genotype, 1 | block:garden, 1 | garden, 1 | indiv
+# Disable this warning with 'allow.new.levels=TRUE'
+
+# 2: In checkTerms(data.tmb1$termszi, data.tmb0$termszi) :
+#   Predicting new random effect levels for terms: 1 | genotype, 1 | block:garden, 1 | garden, 1 | indiv
+# Disable this warning with 'allow.new.levels=TRUE
+
+par(mfrow = c(2,2))
+# overall model
+plot_predicted_vs_actual(model_R(mod, newdata =  df.scaled, re.form = NULL), title = 'overall, with random effects')
+plot_predicted_vs_actual(model_R(mod, newdata = df.scaled, re.form = NA), title = 'overall, no random effects')
+# conditional model
+plot_predicted_vs_actual(model_R(mod, type = 'conditional', newdata =  df.scaled, re.form = NULL), title = 'conditional, with random effects')
+plot_predicted_vs_actual(model_R(mod, type = 'conditional', newdata = df.scaled, re.form = NA), title = 'conditional, no random effects')
+
+
+# for each garden
+
+# overall response
+#png(file = paste('results/model_prediction/maxi_growth_predictions_vs_actual_from_model_2yearModel_', garden_clim_colname, '.png', sep = ''),
+# height = 8,
+# width = 12,
+# res = 300,
+# units = 'in')
+
+par(mfrow = c(3,4))
+gards <- unique(df.scaled$garden)
+
+for(n in 1:length(gards)){
+  
+  gard <- gards[n]
+  # overall model
+  plot_predicted_vs_actual(model_R(mod, df.scaled[df.scaled$garden == gard,], re.form = NULL),
+                           title = paste(gard, 'overall, with random effects'),
+                           legend = ifelse(n == 1, T, F))
+  plot_predicted_vs_actual(model_R(mod, df.scaled[df.scaled$garden == gard,], re.form = NA), 
+                           title = paste(gard, 'overall, no random effects'), legend = F)
+  # conditional model
+    plot_predicted_vs_actual(model_R(mod, df.scaled[df.scaled$garden == gard,], re.form = NULL, type = 'conditional'),
+                           title = paste(gard, 'conditional, with random effects'), legend = F)
+  plot_predicted_vs_actual(model_R(mod, df.scaled[df.scaled$garden == gard,], re.form = NA, type = 'conditional'), 
+                           title = paste(gard, 'conditional, no random effects'), legend = F)
+  
+}
+
+#dev.off()
+
+
+# just conditional with random effects, to match the mini gardens validation plots
+
+#png(file = paste('results/model_prediction/validation_MaxiPredictions_2yearModel', garden_clim_colname, '_vs_', pheno_colname, '.png', sep = ''), width = 9, height = 3, res = 300, units = 'in')
+
+cols <- c("#2B3D26", "#B3446C", "#2b3e85")
+
+par(mfrow = c(1,3))
+
+for(n in 1:length(gards)){
+  
+  gard <- gards[n]
+  col <- adjustcolor(cols[n], alpha = 0.6)
+  
+  plot_predicted_vs_actual(model_R(mod, df.scaled[df.scaled$garden == gard,], re.form = NA, type = 'conditional'), 
+                           title = paste(gard, '(Maxi)'),
+                           col = col,
+                           col_fit = col,
+                           col_1to1 = 'grey')
+  
+}
+
+#dev.off()
+  
+    
+    
+
+# test prediction ability for each genotype
+
+genos <- unique(df.scaled$genotype)
+
+
+geno.r.resp <- rep(NA, length(genos))
+geno.r.cond <- rep(NA, length(genos))
+
+
+for(n in 1:length(genos)){
+  
+  geno <- genos[n]
+  
+  sub <- df.scaled[df.scaled$genotype == geno,]
+  
+  # checks before trying to predict
+  # 1. need to have at least three observations
+  # 2. if genotype is missing information, skip it
+  # ok if phenotype has some NAs
+  if(length(sub$pheno[! is.na(sub$pheno)]) > 2 &
+     sum(is.na(sub[,colnames(sub != 'pheno')])) == 0){
+    
+    resp <- model_R(mod, sub, type = 'response', re.form = NULL)
+    
+    # only run conditional if there are enough live trees
+    if(nrow(sub[rownames(sub) %in% alive21,]) > 2){
+       cond <- model_R(mod, sub, type = 'conditional', re.form = NULL)
+    }
+   
+    
+    geno.r.resp[n] <- resp$cor$estimate
+    geno.r.cond[n] <- cond$cor$estimate
+    
+  }
+  
+  
+  # if(n %% 20 == 0){
+  #   cat(paste('done with', n, '\n'))
+  # }
+}
+
+names(geno.r.resp) <- genos
+names(geno.r.cond) <- genos
+
+par(mfrow = c(1,2))
+hist(geno.r.resp)
+hist(geno.r.cond)
+
+
+# which genotypes are more predictable?
+
+geno_info <- as.data.frame(matrix(nrow= length(genos), ncol = 6))
+colnames(geno_info) <- c('k2_tricho', 'genetic_PC1', 'genetic_PC2', 'genetic_PC3', 'TRANSECT', 'in_minis' )
+
+rownames(geno_info) <- genos
+
+geno_colnames <- c('k2_tricho', 'genetic_PC1', 'genetic_PC2', 'genetic_PC3', 'TRANSECT')
+
+for(n in 1:nrow(geno_info)){
+  
+  geno <- rownames(geno_info)[n]
+  
+  # get first row with info for this genotype
+  geno_row <- maxis[match(geno, maxis$TAG), geno_colnames]
+  
+  geno_info[n, geno_colnames] <- geno_row
+  
+  # is the genotype in the mini gardens?
+  geno_info[n, 'in_minis'] <- geno %in% mod$frame$genotype
+
+}
+
+geno_info$Rval_resp <- geno.r.resp
+geno_info$Rval_cond <- geno.r.cond
+
+# there are a lot of missing values due to low sample size for some genotypes. Look at using residuals instead? or some other measure of accuracy?
+
+# are predictions better for genotypes that were included in the minis (training dataset)?
+# average R values are similar, but more variance in accuracy for non-mini genotypes, and most of the negative R values are non-mini genotypes
+par(mfrow = c(1,2), mar = c(8,4,4,3))
+boxplot(geno_info$Rval_resp ~ geno_info$in_minis)
+abline(h = 0, col = 'blue')
+boxplot(geno_info$Rval_cond ~ geno_info$in_minis)
+abline(h = 0, col = 'blue')
+
+plot(density(geno_info[geno_info$in_minis == F,'Rval_resp'], na.rm = T))
+
+# is there variance across transects?
+# not too much variance across transects, including WY which was not in minis
+# lost of variation in accuracy for crowsnest conditional model
+par(mfrow = c(1,2), mar = c(8,4,4,3))
+boxplot(geno_info$Rval_resp ~ geno_info$TRANSECT, las = 2, xlab = '')
+abline(h = 0, col = 'blue')
+boxplot(geno_info$Rval_cond ~ geno_info$TRANSECT, las = 2, xlab = '')
+abline(h = 0, col = 'blue')
+
+# plot cor against genetic info
+# genotypes with low R values are both balsam and tricho
+
+par(mfrow = c(1,2))
+
+plot(geno_info$k2_tricho, geno_info$Rval_resp)
+abline(h = 0, col = 'blue')
+plot(geno_info$k2_tricho, geno_info$Rval_cond)
+abline(h = 0, col = 'blue')
+
+plot(geno_info$genetic_PC1, geno_info$Rval_resp)
+abline(h = 0, col = 'blue')
+plot(geno_info$genetic_PC1, geno_info$Rval_cond)
+abline(h = 0, col = 'blue')
+
+plot(geno_info$genetic_PC2, geno_info$Rval_resp)
+abline(h = 0, col = 'blue')
+plot(geno_info$genetic_PC2, geno_info$Rval_cond)
+abline(h = 0, col = 'blue')
+
+plot(geno_info$genetic_PC3, geno_info$Rval_resp)
+abline(h = 0, col = 'blue')
+plot(geno_info$genetic_PC3, geno_info$Rval_cond)
+abline(h = 0, col = 'blue')
+
+```

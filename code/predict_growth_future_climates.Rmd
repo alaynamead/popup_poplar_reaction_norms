@@ -1,0 +1,700 @@
+---
+title: "Predict growth changes under future climate"
+author: "Alayna Mead"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    toc: true
+    number_sections: true
+    highlight: rstudio
+---
+
+Using the genotype-specific modeled reaction norms produced by 'transfer_function_multiyear_linear_mixed_effects_model.Rmd' script, predict how each genotype's growth and survival could change under future temperatures (represented by MCMT).
+
+# Setup
+
+## Load libraries and data
+
+```{r setup}
+
+library(ggplot2)
+library(glmmTMB) # model
+library(sf) # mapping
+library(terra) # climate rasters
+library(RColorBrewer) # colors
+library(circlize) # colorRamp2
+
+# load garden data - named 'dat'
+# remove the 2024 data
+load('data/clean/mini_garden_phenotypic_and_climate_data_2021-2024.Rdata')
+dat <- dat[, !endsWith(colnames(dat), '2024')]
+
+# load model info
+# mod: model
+# df.scaled: scaled mini garden data that went into the model
+# scaling_factor: used to scale variables before fitting model
+load('results/model_prediction/glmTMB_multiyear_model_outputs_garden_MCMT_2021-2022_vs_GrowthIncrement_2021-2022.Rda')
+
+# load predicted heights for each genotype - named 'predictions'
+load('results/model_prediction/predictedGrowth_acrossClimates_byGenotype_garden_MCMT_2021-2022.Rdata')
+preds <- predictions
+rm(predictions)
+
+sessionInfo()
+
+```
+
+
+```{r markdown_settings}
+
+knitr::opts_chunk$set(fig.width = 8, fig.height = 10)
+
+```
+
+## Back-transform input data
+
+Data used for input to model was scaled - back-transform it to the actual values.
+
+```{r backtransform}
+
+df <- df.scaled
+
+for(n in 1:length(scaling_factor)){
+  
+  column <- names(scaling_factor)[n]
+  
+  df[,column] <- df.scaled[,column]/scaling_factor[[n]]
+  
+}
+
+head(df)
+
+```
+
+## Extract genotype info
+
+Get genetic and climate data for each genotype
+
+```{r genotype_info}
+
+# get info for each genotype to use for extracting climate data and predicting height under future climates
+
+# columns to get - these will be the same for each replicate of a genotype
+dput(colnames(dat))
+columns <- c("Genotype", "Plant_ID", "Pb", "Pt", "transect", "provenance_latitude", "provenance_longitude", "provenance_elevation_m", "provenance_TD", "provenance_MCMT", "genetic_PC1", "genetic_PC2", "genetic_PC3", "genetic_PC4", "genetic_PC5", "plastid_ID", "color_Pt", "color_k3")
+
+# get genotypes
+genos <- unique(dat$Genotype)
+genos <- genos[! is.na(genos)]
+
+# get the rows that have the first match of each genotype
+rows <- match(genos, dat$Genotype)
+
+# get subset of dataframe with these rows and the info we want for each genotype
+geno.info <- dat[rows, columns]
+rownames(geno.info) <- geno.info$Genotype
+
+# remove the ones with missing genetic info
+geno.info <- geno.info[! is.na(geno.info$genetic_PC1),]
+dim(geno.info)
+str(geno.info)
+
+```
+
+# Get future climates for each genotype
+
+## Load climate data
+
+Load future and historic MCMT raster files
+
+ClimateNA raster files used here are available from DataBasin:
+
+https://adaptwest.databasin.org/pages/adaptwest-climatena/
+
+Species range shapefiles are from Little 1971 and are available from DataBasin:
+
+P. balsamifera: https://databasin.org/datasets/91380e091ca048359a66fc65962ed210/
+
+P. trichocarpa: https://databasin.org/datasets/84e47784fe2a463c8b292007fb43f2cd/
+
+```{r load_climate}
+
+# which climate variable is being used? 
+# can change this to use a different variable
+clim_var <- 'MCMT'
+
+# get historic and future climate
+
+hist <- rast(paste('data/climate/climateNA/Normal_1961_1990/Normal_1961_1990_bioclim/Normal_1961_1990_', clim_var, '.tif', sep = ''))
+crs(hist, proj = T)
+
+hist91 <- rast(paste('data/climate/climateNA/Normal_1991_2020/Normal_1991_2020_', clim_var, '.tif', sep = ''))
+crs(hist, proj = T)
+
+# climateNA provides future ensemble models built from 8 GCMs and 13 GCMs - test both
+
+fut8 <- rast(paste('data/climate/climateNA/future/ensemble_8GCMs_ssp245_2041_2070_bioclim/ensemble_8GCMs_ssp245_2041_2070_', clim_var, '.tif', sep = ''))
+
+fut13 <- rast(paste('data/climate/climateNA/future/ensemble_13GCMs_ssp245_2041_2070_bioclim/ensemble_13GCMs_ssp245_2041_2070_', clim_var, '.tif', sep = ''))
+
+################ convert coords
+
+# convert coordinates of collection sites to the CRS used by climateNA
+crs.cna <- crs(hist, proj = T)
+
+# provenance coordinates
+coords.prov <- st_as_sf(geno.info[,c("provenance_longitude", "provenance_latitude")], coords = c(1,2), crs = st_crs(4326))
+coords.prov.cna <- st_transform(coords.prov$geometry, crs = crs.cna)
+
+# load shapefile of state/province borders
+borders <- read_sf('data/shapefiles/NorthAmerica_PoliticalBoundaries_Shapefile/NA_PoliticalDivisions/data/bound_p/boundaries_p_2021_v3.shp')
+borders <- st_transform(borders, crs = crs.cna)
+# simplify to 1 km
+borders <- st_simplify(borders, dTolerance = 1000)
+
+# species rangemaps
+# shapefile
+balsam <- st_read('data/shapefiles/Pbal_shapefile/data/commondata/data0/popubals.shp')
+tricho <- st_read('data/shapefiles/Ptri_shapefile/data/commondata/data0/poputric.shp')
+
+# convert CRS
+balsam <- st_transform(balsam, crs.cna)
+tricho <- st_transform(tricho, crs.cna)
+
+# test plot
+plot(hist)
+
+plot(balsam$geometry, add = T, border = 'navy')
+plot(tricho$geometry, add = T, border = 'grey50')
+plot(borders$geometry, add = T)
+
+
+
+```
+
+## Extract future climates for each genotype's home site
+
+```{r extract_future}
+
+# extract from raster and add to geno.info
+
+# 8 GCM ensemble
+tmp <- extract(fut8, y = st_as_sf(coords.prov))
+geno.info$future8_MCMT <- tmp[,2]
+
+# 13 GCM ensemble
+tmp <- extract(fut13, y = st_as_sf(coords.prov))
+geno.info$future13_MCMT <- tmp[,2]
+
+# predictions from the two ensembles are very similar
+plot(geno.info$future8_MCMT, geno.info$future13_MCMT)
+abline(0, 1, col = 'blue')
+
+```
+
+# Predict height at future climates
+
+## Predict functions
+
+```{r predict_functions}
+
+# originally from transfer function script
+
+# predict each genotype's response to a vector of climate (MCMT) values
+# garden_clims is a vector
+
+predict_genotype <- function(model, 
+                             type = 'response', # can also be conditional or zprob
+                             effects,
+                             home_clim,
+                             garden_clims){
+  
+  # vector to save predictions
+  pred_height <- vector()
+  
+  # loop through garden climates
+  for(g in 1:length(garden_clims)){
+    
+    home <- home_clim
+    garden <- garden_clims[g]
+    
+    # make newdata to give to predict()
+    new_data <- as.data.frame(cbind(home, garden, home^2, garden^2))
+    colnames(new_data) <- c('home_clim', 'garden_clim', 'home_clim_2', 'garden_clim_2')
+    # add other random or fixed effects
+      for(n in 1:length(effects)){
+        new_data[names(effects[n])] <- effects[n]
+      }
+    
+    # first have to scale new_data to match the scaled data used in model
+    for(v in 1:length(new_data)){
+      var <- names(new_data)[v]
+      
+      # only scale if var exists in scaling_factor - random effects like genotype are not in scaling factor
+      # IF VARIABLES ARE NAMED DIFFERENTLY HERE IN effects AND scaling_factor IT WILL SKIP THEM
+      if(var %in% names(scaling_factor)){
+        new_data[var] <- new_data[var]*scaling_factor[[var]]
+      } else {
+        warning(var, ' does not have a scaling factor, skipping')
+      }
+      
+      
+    }
+    
+    pred <- predict(mod, type = type, newdata = new_data, re.form = NA, allow.new.levels=TRUE)
+    # back transform from log if we're predicting height
+    # zprob is probability of a zero, so don't transform
+    if(type %in% c('response', 'conditional')){
+      pred <- exp(pred)-1
+    }
+    pred_height[g] <- pred
+    
+  }
+  
+  # save
+  pred_height_df <- data.frame(garden_clim = garden_clims, predicted_height = pred_height) 
+  
+return(pred_height_df)
+}
+
+
+```
+
+## Predict response to historic and future climate for each genotype
+
+```{r predict_hist, warning = F}
+
+# model predictions for historic data
+# we already have historic provenance data for the model, so don't need to extract it from the raster
+
+# what climate variable are we using?
+clim_var <- 'MCMT'
+prov_clim_colname <- paste('provenance', clim_var, sep = '_')
+gard_clim_colname <- paste('garden', clim_var, '1961_1990', sep = '_')
+fut8_colname <- paste('future8', clim_var, sep = '_')
+fut13_colname <- paste('future13', clim_var, sep = '_')
+
+
+# add predictions to geno.info dataframe
+# historic
+geno.info$hist_response <- NA
+geno.info$hist_height <- NA
+geno.info$hist_mortality <- NA
+
+# future 8
+geno.info$fut8_response <- NA
+geno.info$fut8_height <- NA
+geno.info$fut8_mortality <- NA
+
+# future 13
+geno.info$fut13_response <- NA
+geno.info$fut13_height <- NA
+geno.info$fut13_mortality <- NA
+
+
+for(n in 1:nrow(geno.info)){
+  
+  geno <- rownames(geno.info)[n]
+  
+  # setup effects
+  g.pc1 <- geno.info$genetic_PC1[n]
+  g.pc2 <- geno.info$genetic_PC2[n]
+  g.pc3 <- geno.info$genetic_PC3[n]
+  g.home_clim <- geno.info[,prov_clim_colname][n]
+  
+  # garden clims are the historic and future climates
+  # in order: home climate (historic), future climate 8 GCMs, future climate 13 GCMs
+  g.clims <- c(g.home_clim, geno.info[,fut8_colname][n], geno.info[,fut13_colname][n])
+  
+  # predict overall response
+  resp <- predict_genotype(mod,
+                   type = 'response',
+                   effects = list(pc1 = g.pc1, 
+                                  pc2 = g.pc2,
+                                  pc3 = g.pc3,
+                                  genotype = geno), 
+                   home_clim = g.home_clim, 
+                   garden_clims = g.clims)
+  
+  # save to df
+  geno.info$hist_response[n] <- resp$predicted_height[1]
+  geno.info$fut8_response[n] <- resp$predicted_height[2]
+  geno.info$fut13_response[n] <- resp$predicted_height[3]
+
+  
+  
+  # predict height (conditional model)
+  cond <- predict_genotype(mod,
+                           type = 'conditional',
+                           effects = list(pc1 = g.pc1, 
+                                          pc2 = g.pc2,
+                                          pc3 = g.pc3,
+                                          genotype = geno), 
+                           home_clim = g.home_clim, 
+                           garden_clims = g.clims)
+  
+  # save to df
+  geno.info$hist_height[n] <- cond$predicted_height[1]
+  geno.info$fut8_height[n] <- cond$predicted_height[2]
+  geno.info$fut13_height[n] <- cond$predicted_height[3]
+
+  # predict probability of mortality (zero-inflated model)
+  zi <- predict_genotype(mod,
+                         type = 'zprob',
+                         effects = list(pc1 = g.pc1, 
+                                        pc2 = g.pc2,
+                                        pc3 = g.pc3,
+                                        genotype = geno), 
+                         home_clim = g.home_clim, 
+                         garden_clims = g.clims)
+  # save to df
+  geno.info$hist_mortality[n] <- zi$predicted_height[1]
+  geno.info$fut8_mortality[n] <- zi$predicted_height[2]
+  geno.info$fut13_mortality[n] <- zi$predicted_height[3]
+
+  
+ #cat(paste('done with', n, '\n'))
+  
+}
+
+# predict_genotype() gives warning:
+# '## Warning in predict_genotype(mod, type = "response", effects = list(pc1 = g.pc1,
+## : genotype does not have a scaling factor, skipping'
+
+# this is fine, genotype is a string not numeric and shouldn't be scaled
+
+```
+
+## Calculate change in fitness under future climates
+
+```{r calc_change}
+
+# calculate changes in fitness under future climates
+
+##########
+# future (8 GCMs)
+
+# net change in response
+geno.info$fut8_response_change <- geno.info$fut8_response - geno.info$hist_response
+# percent change
+geno.info$fut8_response_change_percent <- (geno.info$fut8_response - geno.info$hist_response)/geno.info$hist_response
+
+# net change in height
+geno.info$fut8_height_change <- geno.info$fut8_height - geno.info$hist_height
+# percent change
+geno.info$fut8_height_change_percent <- (geno.info$fut8_height - geno.info$hist_height)/geno.info$hist_height
+
+# net change in mortality probability
+geno.info$fut8_mortality_change <- geno.info$fut8_mortality - geno.info$hist_mortality
+# percent change
+geno.info$fut8_mortality_change_percent <- (geno.info$fut8_mortality - geno.info$hist_mortality)/geno.info$hist_mortality
+
+##########
+# future (13 GCMs)
+
+# net change in response
+geno.info$fut13_response_change <- geno.info$fut13_response - geno.info$hist_response
+# percent change
+geno.info$fut13_response_change_percent <- (geno.info$fut13_response - geno.info$hist_response)/geno.info$hist_response
+
+# net change in height
+geno.info$fut13_height_change <- geno.info$fut13_height - geno.info$hist_height
+# percent change
+geno.info$fut13_height_change_percent <- (geno.info$fut13_height - geno.info$hist_height)/geno.info$hist_height
+
+# net change in mortality probability
+geno.info$fut13_mortality_change <- geno.info$fut13_mortality - geno.info$hist_mortality
+# percent change
+geno.info$fut13_mortality_change_percent <- (geno.info$fut13_mortality - geno.info$hist_mortality)/geno.info$hist_mortality
+
+# preliminary plots
+par(mfrow = c(2,3))
+hist(geno.info$fut8_response_change_percent)
+hist(geno.info$fut8_height_change_percent)
+hist(geno.info$fut8_mortality_change_percent)
+
+hist(geno.info$fut13_response_change_percent)
+hist(geno.info$fut13_height_change_percent)
+hist(geno.info$fut13_mortality_change_percent)
+
+```
+
+# Map predictions for each collected genotype/site
+
+```{r map_local_response_one_var}
+
+# baseline plot of climate difference
+
+diff13 <- fut13 - hist
+diff8 <- fut8 - hist
+
+par(mfrow = c(1,2))
+plot(diff13)
+plot(diff8)
+
+# color palette for MCMT base layer
+
+colf <- colorRampPalette(brewer.pal(9, 'YlOrRd'))
+cols <- colf(100)
+cols2 <- adjustcolor(cols, alpha = 0.5)
+
+# function to map the response 
+
+# future = the raster object for change in climate to use as background map
+# response = the column name from geno.info of the response to future climate to plot
+# main = plot title
+# rev = reverse response color palette? Can use for mortality so a negative/positive response has the same color
+map_change <- function(future, response, main = '', rev = FALSE, legend = FALSE, raster = FALSE, ...){
+  
+  # which model response are we plotting?
+  resp_name <- response
+  
+  colf <- colorRampPalette(brewer.pal(9, 'YlOrRd'), alpha = 0.5)
+  cols <- colf(100)
+  cols <- adjustcolor(cols, alpha = 0.6)
+  
+  #par(mfrow = c(1,1))
+  plot(future, 
+       col = ifelse(raster == TRUE, cols, 'white'),
+       main = main,
+       xaxt = 'n', yaxt = 'n', 
+       pax = list(side=NA),
+       xlim = c(-3000000,-500000), ylim = c(400000,3200000), 
+       legend = legend,
+       plg = list(title = 'Future -\nHistoric\n MCMT (°C)'),
+       ...)
+  
+  # add borders and species ranges
+  plot(borders$geometry, add = T, lwd = 0.5)
+  plot(balsam$geometry, add = T, border = 'navy')
+  plot(tricho$geometry, add = T, border = 'darkgreen')
+  
+
+  # color palette for change in response
+  min_change <- min(geno.info[,resp_name])
+  max_change <- max(geno.info[,resp_name])
+  
+  ceil2 <- max(abs(min_change), abs(max_change))
+  
+  if(rev == FALSE){
+    colf <- colorRamp2( breaks = c(-ceil2, 0, ceil2), colors = c('darkorchid4', 'white', 'palegreen4'))
+  } else if(rev == TRUE){
+    colf <- colorRamp2( breaks = c(-ceil2, 0, ceil2), colors = c('palegreen4', 'white', 'darkorchid4'))
+  }
+  
+  
+  cols2 <- colf(geno.info[,resp_name])
+  
+  # plot points for each genotype
+  points(coords.prov.cna, bg = cols2,  pch = 21, cex = 2, lwd = 1.5)
+  
+  # add colors of upper and lower bounds to legend
+  if(rev == FALSE){
+     pt.cols <- c('darkorchid4', 'white', 'palegreen4')
+  } else if(rev == TRUE) {
+    pt.cols = c('palegreen4', 'white', 'darkorchid4')
+  }
+ 
+  
+  # legend(-2.8e6,1.5e6, title = '% Change',
+  #        legend = c(round(-ceil2,2), 0, round(ceil2,2)),
+  #        pch = 21,
+  #        pt.bg = pt.cols,
+  #        pt.cex = 2)
+  
+  vals <- round(c(min_change, 0, max_change),2)
+  # if range doesn't overlap 0, remove it
+  if(min_change * max_change > 0){
+    vals <- vals[vals!=0]
+  }
+  
+  legend(-2.8e6,1.5e6, title = '% Change',
+         legend = vals,
+         pch = 21,
+         pt.bg = colf(vals),
+         pt.cex = 2)
+  
+  
+}
+
+
+par(mfrow = c(2,3))
+map_change(diff13, 'fut13_response_change_percent')
+map_change(diff13, 'fut13_height_change_percent')
+map_change(diff13, 'fut13_mortality_change_percent', rev = T)
+
+map_change(diff8, 'fut8_response_change_percent')
+map_change(diff8, 'fut8_height_change_percent')
+map_change(diff8, 'fut8_mortality_change_percent', rev = T)
+
+# raw values (cm or % mortality)
+# legend title not correct here
+par(mfrow = c(2,3))
+map_change(diff13, 'fut13_response_change')
+map_change(diff13, 'fut13_height_change')
+map_change(diff13, 'fut13_mortality_change', rev = T)
+
+map_change(diff8, 'fut8_response_change')
+map_change(diff8, 'fut8_height_change')
+map_change(diff8, 'fut8_mortality_change', rev = T)
+
+
+#png(file = paste('results/model_prediction/fitness_changes_map_2yearModel', clim_var, '_13GCMs.png', sep = ''), height = 8, width = 8, res = 300, units = 'in')
+
+
+# lighter colors for temperature raster
+colf <- colorRampPalette(brewer.pal(9, 'YlOrRd'))
+cols <- colf(100)
+cols2 <- adjustcolor(cols, alpha = 0.5)
+
+# plot genotypes and the 13-gcm ensemble
+par(mfrow = c(2,2))
+# set margins
+marg <- c(1,1,4,3)
+
+plot(diff13, col = cols2, 
+     main = paste(clim_var, ' 2041-2070, 13 GCMs', sep = ''),
+     xaxt = 'n', yaxt = 'n', 
+     pax = list(side=NA),
+     mar = marg,
+     xlim = c(-3000000,-500000), ylim = c(400000,3200000), 
+     plg = list(title = 'Future -\nHistoric\n MCMT (°C)'))
+# add borders and species ranges
+plot(borders$geometry, add = T, lwd = 0.5)
+plot(balsam$geometry, add = T, border = 'navy')
+plot(tricho$geometry, add = T, border = 'darkgreen')
+
+points(coords.prov.cna, bg = geno.info$color_Pt, pch = 21, cex = 2)
+
+map_change(diff13, 'fut13_response_change_percent', main = 'Overall response', mar = marg)
+map_change(diff13, 'fut13_height_change_percent', main = 'Growth', mar = marg)
+map_change(diff13, 'fut13_mortality_change_percent', rev = T, main = 'Probability of Mortality', mar = marg)
+
+
+#dev.off()
+
+
+```
+
+# Map rangewide predictions for each genotype
+
+## Map past and future fitness predictions and change for each genotype
+
+```{r map_rangewide_genotype_one_var, fig.height = 5, fig.width = 12}
+
+
+# custom predict function - predict height from discrete set of climate values that have already been calculated
+
+predict_disc <- function(value, pred_clim, pred_value){
+  if(! is.na(value)){
+    # which value in pred_clim (already predicted climates) is closest to the value we want to predict?
+    # returns the index
+    ind <- which.min(abs(pred_clim - value))
+    
+    # return the predicted height for that index
+    return(pred_value[ind])
+    
+  } else if(is.na(value)){
+    return(NA)
+  }
+}
+
+# which climate variable to use?
+clim_var <- 'MCMT'
+hist_rast <- hist
+fut_rast <- fut13
+
+# set up input raster - historic climate
+hist.crop <- crop(hist_rast, ext(-4e6, 0, 0, 3e6))
+plot(hist.crop)
+# make values outside predict range NA
+# need pred_clim - this is the same for all genotypes, so can just use first one
+#pred_clim <- preds$overall$genotype_210$garden_clim
+#pred_clim <- dat[,gard_clim_colname]
+pred_clim <- c(dat$garden_MCMT_2021, dat$garden_MCMT_2022)
+
+msk <- ifel(hist.crop > max(pred_clim) | hist.crop < min(pred_clim), NA, 1)
+hist.crop <- mask(hist.crop, msk)
+plot(hist.crop, colNA = 'grey')
+
+# future climate
+fut13.crop <- crop(fut_rast, ext(-4e6, 0, 0, 3e6))
+plot(fut13.crop)
+# make values outside predict range NA
+# need pred_clim - this is the same for all genotypes, so can just use first one
+# pred_clim <- preds$overall$genotype_210$garden_clim
+msk <- ifel(fut13.crop > max(pred_clim) | fut13.crop < min(pred_clim), NA, 1)
+fut13.crop <- mask(fut13.crop, msk)
+plot(fut13.crop, colNA = 'grey')
+
+
+# loop through genotypes, predict height across range
+
+par(mfrow = c(1,3), mar = c(5,4,4,5))
+for(n in 1:length(preds$overall)){
+  
+  # predicted climate and predicted height for this genotype
+  pred_clim <- preds$overall[[n]]$garden_clim
+  pred_value <- preds$overall[[n]]$predicted_height
+  
+  #### historic
+  # set heights for each raster cell in historic climate (returns a list)
+  heights_cells_hist <- lapply(values(hist.crop), FUN = function(x) predict_disc(x, pred_clim, pred_value))
+  # assign heights to raster
+  height_hist <- setValues(hist.crop, values = unlist(heights_cells_hist))
+  
+  # plot
+   colf <- colorRampPalette(rev(brewer.pal(9, 'YlGn')))
+   cols <- rev(colf(100))
+  
+  plot(height_hist, col = cols, main = paste(names(preds$overall)[n], '\nFitness in Historic Climate', sep = ''), colNA = 'grey90')
+  
+  plot(borders$geometry, add = T)
+  plot(balsam$geometry, add = T, border = 'navy')
+  plot(tricho$geometry, add = T, border = 'grey50')
+  
+  points(coords.prov.cna[n], col = 'mediumpurple', lwd = 2, cex = 1.5)
+  #points(coords.prov.cna)
+  
+    #### future
+  # set heights for each raster cell in historic climate (returns a list)
+  heights_cells_fut <- lapply(values(fut13.crop), FUN = function(x) predict_disc(x, pred_clim, pred_value))
+  # assign heights to raster
+  height_fut <- setValues(fut13.crop, values = unlist(heights_cells_fut))
+  
+  # plot
+
+  plot(height_fut, col = cols, main = 'Fitness in Future Climate', colNA = 'grey90')
+  
+  plot(borders$geometry, add = T)
+  plot(balsam$geometry, add = T, border = 'navy')
+  plot(tricho$geometry, add = T, border = 'grey50')
+  
+  points(coords.prov.cna[n], col = 'mediumpurple', lwd = 2, cex = 1.5)
+  #points(coords.prov.cna)
+  
+  ### plot difference
+  height_diff <- height_fut - height_hist
+  
+  # min and max values for diverging color palette
+  min_var <- minmax(height_diff)[1,]
+  max_var <- minmax(height_diff)[2,]
+  ceil <- max(abs(min_var), abs(max_var))
+  
+  colf_diff <- colorRampPalette(brewer.pal(11, 'RdBu'))
+  cols_diff <- colf_diff(100)
+  
+  plot(height_diff, col = cols_diff, range = c(-ceil, ceil), main = 'Fitness change', colNA = 'grey90')
+  
+  plot(borders$geometry, add = T)
+  plot(balsam$geometry, add = T, border = 'navy')
+  plot(tricho$geometry, add = T, border = 'grey50')
+  
+  points(coords.prov.cna[n], col = 'black', lwd = 2, cex = 1.5)
+  
+  print(paste('done with', n))
+  
+}
+
+```
+

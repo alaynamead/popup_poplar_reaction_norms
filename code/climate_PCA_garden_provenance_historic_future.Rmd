@@ -1,0 +1,527 @@
+---
+title: "Climate PCA"
+author: "Alayna Mead"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    toc: true
+    number_sections: true
+    highlight: rstudio
+---
+
+# Setup
+
+```{r setup}
+
+library(vegan)
+library(viridis) # color palette
+library(pals) # color palette
+library(psych) # pairs.panels
+library(ggplot2)
+library(ggnewscale) # multiple color scales
+library(ggtext) # for using markdown in legend title 'legend.title = element_markdown()'
+
+# climates in long format - named 'all'
+load(file = 'data/clean/546_genotypes_provenance_future_historic_climate_with_gardens_long_format.Rda')
+clim <- all
+rm(all)
+
+# only need one set of future climates - remove 8 GCMs
+clim <- clim[clim$period != "2041_2070_8GCMs",]
+
+# ggplot theme
+theme_set(theme_bw(base_size = 18))
+
+sessionInfo()
+
+```
+
+
+```{r markdown_settings}
+
+knitr::opts_chunk$set(fig.width = 10, fig.height = 8)
+
+```
+
+
+# Reduce climate variables
+
+```{r reduce_vars}
+
+# Derived annual variables:
+# DD<0              degree-days below 0°C, chilling degree-days
+# DD>5              degree-days above 5°C, growing degree-days
+# DD<18            degree-days below 18°C, heating degree-days
+# DD>18            degree-days above 18°C, cooling degree-days
+# NFFD              the number of frost-free days
+# FFP                 frost-free period
+# bFFP               the day of the year on which FFP begins
+# eFFP                the day of the year on which FFP ends
+# PAS                 precipitation as snow (mm) between August in previous year and July in current year
+# EMT                extreme minimum temperature over 30 years
+# EXT                extreme maximum temperature over 30 years
+# Eref                 Hargreaves reference evaporation (mm)
+# CMD               Hargreaves climatic moisture deficit (mm)
+# MAR               mean annual solar radiation (MJ m‐2 d‐1)
+# RH                  mean annual relative humidity (%)
+# CMI                Hogg’s climate moisture index (mm)
+# DD1040 (10<DD<40)    degree-days above 10°C and below 40°C
+
+vars <- c("lat", "lon", "elev", "AHM", "bFFP", "CMD", "CMI", "DD_0", "DD_18", "DD1040", "DD18", "DD5", "eFFP", "EMT", "Eref", "EXT", "FFP", "MAP", "MAR", "MAT", "MCMT", "MSP", "MWMT", "NFFD", "PAS", "RH", "SHM", "TD")
+
+pairs.panels(clim[,vars], scale = T)
+
+vars <- c("MWMT", "MCMT", "TD", "MAP", "MSP", "SHM", "PAS", "EMT", "CMD", "RH")
+
+pairs.panels(clim[,vars], scale = T)
+
+# remove EMT
+
+vars <- c("MWMT", "MCMT", "TD", "MAP", "MSP", "SHM", "PAS", "CMD", "RH")
+
+pairs.panels(clim[,vars], scale = T)
+
+```
+
+# PCA
+
+PCA of climate across all home sites and garden sites (both minis and maxis), 544 genotypes,  historic (1961-1990) and future (2041-2070, 13GCM ensemble) climates, and yearly garden climates for 2020-2023.
+
+Uses rda() funcion from vegan package
+
+```{r pca_all}
+
+# reorder so gardens are plotted last
+clim <- clim[order(clim$site_type, decreasing = T),]
+
+# add site-period column
+clim$site_period <- paste(clim$site_name, clim$period, sep = '_')
+
+
+# climate variables to use
+
+vars <- c("CMD", "MAP", "MAT", "MCMT", 'MWMT', "PAS", "RH", "TD", "lat", "lon")
+
+# run PCA
+rda <- rda(clim[,vars], scale = T)
+summary(rda)
+
+biplot(rda)
+plot(rda)
+
+info <- summary(rda)
+barplot(info$cont$importance[2,])
+
+# look at loadings
+rda$CA$v
+barplot(rda$CA$v[,1])
+barplot(rda$CA$v[,2])
+barplot(rda$CA$v[,3])
+# PC1 mostly temperatures/latitude
+# PC2 mostly precipitation/continentality
+# PC3 mostly CMD/continentality
+
+```
+
+# Plots
+## Setup
+
+```{r plots_setup}
+
+# setup colors and shapes for nice plot
+
+# color based on transect or garden
+# provenances are colored by genotype ancestry, garden sites each have their own color
+
+clim$gards <-  NA
+clim$gards[clim$site_type == 'garden'] <- clim$site_name[clim$site_type == 'garden']
+
+clim$gards <- factor(clim$gards, levels = c("EVERGREEN", "ID", "LOCK", "MORTON", "MSU", "NDSU","NWMO", "OLLU", "OSU", "PENN", "SNHU", "SU", "SWMN", "UCM", "VA", "VT", "WI", "WSU", "WYO"))
+
+
+# colors for gardens - picking distinguishable colors from transects
+kelly(22)
+#col_pal <- c("#000004FF", "#330A5FFF", "#781C6DFF", "#BB3754FF", "#FCB519FF", "#006837", "#f1b300", "#ED6925FF", "#114637", "#285a40", "#18453b", "#ffc82e","#006747", "#0056b8", "#d73f09", "#001e44", "#001e60", "#8a0000", "#3a1807", "#002856", "#e87722", "#2b3e85", "#a60f2d", "#492f24", "#FCFFA4FF")
+# remove some colors from output
+col_pal <- c("#008856",  "#8DB600", "#BE0032", "#875692", "#A1CAF1", "#2B3D26", "#C2B280", "#F3C300", "#848482", "#0067A5", "#E68FAC", "#F99379", "#604E97", "#B3446C", "#DCD300", "#2b3e85", "#882D17", "#E25822", "#654522")
+
+
+names(col_pal) <- levels(clim$gards)
+
+
+# vector with colors
+# start with genotype colors
+clim$cols <- clim$color_Pt
+
+# add garden colors
+
+for(n in 1:nrow(clim)){
+  
+  if(clim$site_type[n] == 'garden'){
+    clim$cols[n] <- col_pal[clim$gards[n]]
+  }
+  
+}
+
+# shape by year
+shapes <- clim$period
+shapes[shapes == '2020'] <- 22
+shapes[shapes == '2021'] <- 23
+shapes[shapes == '2022'] <- 24
+shapes[shapes == '2023'] <- 25
+shapes[shapes == '1961_1990'] <- 21
+shapes[shapes == '2041_2070_13GCMs'] <- 1
+shapes <- as.numeric(shapes)
+
+```
+
+## Plot with base R
+
+```{r  plots_baseR}
+
+# PC1 and PC2
+
+# png(file = 'results/climate/climate_PCA_1-2_transects_and_gardens_4yrs.png', height = 8, width = 10, res = 300, units = 'in')
+
+par(cex.lab = 1.5, mar = c(5,5,3,1))
+
+choices = c(1,2)
+
+plot(rda, choices = choices, type = 'none', xlim = c(-3.5, 4),
+     xlab = paste('PC', choices[1], ' (', round(info$cont$importance[2,choices[1]]*100, 1), '% variance explained)', sep = ''),
+     ylab = paste('PC', choices[2], ' (', round(info$cont$importance[2,choices[2]]*100, 1), '% variance explained)', sep = ''))
+points(rda, choices = choices, display = 'sites', col = clim$cols,  pch = shapes, cex = ifelse(clim$site_type == 'garden', 1.5, 1), lwd = 2)
+#text(rda, choices = choices, display = 'sites', col = col, cex = 0.5)
+text(rda, choices = choices, display = 'species', col = 'black', cex = 1.5)
+
+legend('topright', pch = c(1,2,3,0,16, 2), col = c(rep('black', 6)), pt.cex = 2, legend = c('2020', '2021', '2022', '2023','1961-1990', '2041-2070'))
+
+#dev.off()
+
+# PC1 and PC3
+# png(file = 'results/climate/climate_PCA_1-3_transects_and_gardens_4yrs.png', height = 8, width = 10, res = 300, units = 'in')
+
+par(cex.lab = 1.5, mar = c(5,5,3,1))
+
+choices = c(1,3)
+
+plot(rda, choices = choices, type = 'none', xlim = c(-3.5, 4),
+     xlab = paste('PC', choices[1], ' (', round(info$cont$importance[2,choices[1]]*100, 1), '% variance explained)', sep = ''),
+     ylab = paste('PC', choices[2], ' (', round(info$cont$importance[2,choices[2]]*100, 1), '% variance explained)', sep = ''))
+points(rda, choices = choices, display = 'sites', col = clim$cols,  pch = shapes, cex = ifelse(clim$site_type == 'garden', 1, 1), lwd = 2)
+#text(rda, choices = choices, display = 'sites', col = col, cex = 0.5)
+text(rda, choices = choices, display = 'species', col = 'black', cex = 1.5)
+
+legend('topright', pch = c(1,2,3,0,16, 2), col = c(rep('black', 6)), pt.cex = 2, legend = c('2020', '2021', '2022', '2023','1961-1990', '2041-2070'))
+
+#dev.off()
+
+# PC1 and PC3, version without legend
+#png(file = 'results/climate/climate_PCA_1-3_transects_and_gardens_4yrs_nolegend.png', height = 8, width = 10, res = 300, units = 'in')
+
+par(cex.lab = 1.5, mar = c(5,5,3,1))
+
+choices = c(1,3)
+
+plot(rda, choices = choices, type = 'none', xlim = c(-3.5, 4),
+     xlab = paste('PC', choices[1], ' (', round(info$cont$importance[2,choices[1]]*100, 1), '% variance explained)', sep = ''),
+     ylab = paste('PC', choices[2], ' (', round(info$cont$importance[2,choices[2]]*100, 1), '% variance explained)', sep = ''))
+points(rda, choices = choices, display = 'sites', col = clim$cols,  pch = shapes, cex = ifelse(clim$site_type == 'garden', 1, 1), lwd = 2)
+#text(rda, choices = choices, display = 'sites', col = col, cex = 0.5)
+text(rda, choices = choices, display = 'species', col = 'black', cex = 1.5)
+
+
+#dev.off()
+
+```
+
+## Plot with ggplot
+
+```{r plots_ggplot}
+
+#####################
+# ggplot
+
+# merge PCA data for each individual with information dataframe
+to_plot <- cbind.data.frame(clim, rda$CA$u)
+
+clims <- rda$CA$v
+
+no_fut <- which(to_plot$period != '2041_2070_13GCMs')
+
+# only minis
+no_fut_minis <- which(to_plot$period != '2041_2070_13GCMs' & (to_plot$in_minis == TRUE | to_plot$site_type == 'garden'))
+
+ggplot(dat = to_plot, aes(x = PC1, y = PC2)) +
+  geom_line(dat = subset(to_plot, site_type == 'provenance' & in_minis == TRUE), aes(x = PC1, y = PC2, group = site_name), arrow = arrow(ends = 'first', angle = 20, length = unit(0.1, "inches")), col = rgb(0,0,0, alpha = 0.3)) + # arrows
+  geom_point(dat = to_plot[no_fut_minis,], aes(x = PC1, y = PC2), bg = clim$cols[no_fut_minis], pch = shapes[no_fut_minis], cex = 2.5, show.legend = T) + # sites
+  geom_text(data = clims, label = rownames(clims), aes(x = PC1/3, y = PC2/3), size = 8) + # climate loadings
+  scale_color_manual(name = 'sites', breaks = names(col_pal), values = col_pal)
+
+
+ggplot(dat = to_plot, aes(x = PC1, y = PC2)) +
+  geom_line(dat = subset(to_plot, site_type == 'provenance' & in_minis == TRUE), 
+            aes(x = PC1, y = PC2, 
+                group = site_name), 
+            arrow = arrow(ends = 'first', angle = 20, length = unit(0.1, "inches")), col = rgb(0,0,0, alpha = 0.3)) + # arrows
+  geom_point(dat = to_plot[no_fut_minis,], 
+             aes(x = PC1, y = PC2), 
+             bg = clim$cols[no_fut_minis], 
+             pch = shapes[no_fut_minis], 
+             cex = 2.5, 
+             show.legend = T) + # sites
+  geom_text(data = clims, 
+            label = rownames(clims), 
+            aes(x = PC1/3, y = PC2/3), 
+            size = 8) + # climate loadings
+  scale_color_manual(name = 'sites', breaks = names(col_pal), values = col_pal)
+
+# all years
+ggplot(dat = to_plot, aes(x = PC1, y = PC2)) +
+  geom_line(dat = subset(to_plot, site_type == 'provenance' & in_minis == TRUE), 
+            aes(x = PC1, y = PC2, 
+                group = site_name), 
+            arrow = arrow(ends = 'first', angle = 20, length = unit(0.1, "inches")), col = rgb(0,0,0, alpha = 0.3)) + # arrows
+  geom_point(dat = subset(to_plot[no_fut_minis,], site_type == 'garden'),
+             aes(x = PC1, y = PC2, color = site_name, shape = period, size = period)) +
+  scale_size_manual(values = c("1961_1990" = 3, "2041_2070_13GCMs" = 1, "2021" = 4, "2023" = 1, "2020" = 1, "2022" = 1)) +
+  scale_color_manual(name = 'Garden', values = col_pal) + # plot gardens
+  new_scale_color() +
+  geom_point(dat = subset(to_plot[no_fut_minis,], site_type == 'provenance'), 
+             aes(x = PC1, y = PC2, fill = Pt), pch = 21, size = 4) + 
+  scale_fill_gradient2(name = '% P. trichocarpa ancestry',
+                       low = 'dodgerblue2', 
+                       mid = 'grey20', 
+                       high = 'darkolivegreen2', 
+                       midpoint = 0.5)
+
+# only 2021 for minis
+no_fut_minis <- which(to_plot$period != '2041_2070_13GCMs' & (to_plot$in_minis == TRUE | to_plot$site_type == 'garden'))
+  
+#no_fut_minis <- which(to_plot$period == '2021' & (to_plot$in_minis == TRUE | to_plot$site_type == 'garden'))
+  
+# PC1 and PC2
+
+ggplot(dat = to_plot, aes(x = PC1, y = PC2)) +
+  xlab(paste('PC1 (', round(info$cont$importance['Proportion Explained','PC1'],3)*100, '% variance explained)', sep = '')) +
+  ylab(paste('PC2 (', round(info$cont$importance['Proportion Explained','PC2'],3)*100, '% variance explained)', sep = '')) +
+  geom_vline(xintercept = 0, col = 'grey60') + 
+  geom_hline(yintercept = 0, col = 'grey60') + 
+  geom_line(dat = subset(to_plot, site_type == 'provenance' & in_minis == TRUE), 
+            aes(x = PC1, y = PC2, 
+                group = site_name), 
+            arrow = arrow(ends = 'first', angle = 20, length = unit(0.1, "inches")), col = rgb(0,0,0, alpha = 0.3)) + # arrows
+  geom_point(dat = subset(to_plot[no_fut_minis,], site_type == 'garden' & period == '2021'),
+             aes(x = PC1, y = PC2, fill = site_name), pch = 24, size = 4) +
+  scale_fill_manual(name = 'Garden', values = col_pal) + # plot gardens
+  new_scale_fill() +
+  geom_point(dat = subset(to_plot[no_fut_minis,], site_type == 'provenance'), 
+             aes(x = PC1, y = PC2, fill = Pt), pch = 21, size = 4) + 
+  scale_fill_gradient2(name = '% P. trichocarpa ancestry',
+                       low = 'dodgerblue2', 
+                       mid = 'grey20', 
+                       high = 'darkolivegreen2', 
+                       midpoint = 0.5) + # provenance points (historic)
+  geom_text(data = clims, 
+            label = rownames(clims), 
+            aes(x = PC1/4, y = PC2/4), 
+            size = 6) # climate loadings
+
+#ggsave('results/climate/climatePCA_1-2_gardens2021_provenanceMinisPastFutureArrows.png', height = 8, width = 12)
+
+
+# PC1 and PC3
+
+ggplot(dat = to_plot, aes(x = PC1, y = PC3)) +
+  xlab(paste('PC1 (', round(info$cont$importance['Proportion Explained','PC1'],3)*100, '% variance explained)', sep = '')) +
+  ylab(paste('PC3 (', round(info$cont$importance['Proportion Explained','PC3'],3)*100, '% variance explained)', sep = '')) +
+  geom_vline(xintercept = 0, col = 'grey60') + 
+  geom_hline(yintercept = 0, col = 'grey60') + 
+  geom_line(dat = subset(to_plot, site_type == 'provenance' & in_minis == TRUE), 
+            aes(x = PC1, y = PC3, 
+                group = site_name), 
+            arrow = arrow(ends = 'first', angle = 20, length = unit(0.1, "inches")), col = rgb(0,0,0, alpha = 0.3)) + # arrows
+  geom_point(dat = subset(to_plot[no_fut_minis,], site_type == 'garden' & period == '2021'),
+             aes(x = PC1, y = PC3, fill = site_name), pch = 24, size = 4) +
+  scale_fill_manual(name = 'Garden', values = col_pal) + # plot gardens
+  new_scale_fill() +
+  geom_point(dat = subset(to_plot[no_fut_minis,], site_type == 'provenance'), 
+             aes(x = PC1, y = PC3, fill = Pt), pch = 21, size = 4) + 
+  scale_fill_gradient2(name = '% P. trichocarpa ancestry',
+                       low = 'dodgerblue2', 
+                       mid = 'grey20', 
+                       high = 'darkolivegreen2', 
+                       midpoint = 0.5) + # provenance points (historic)
+  geom_text(data = clims, 
+            label = rownames(clims), 
+            aes(x = PC1/4, y = PC3/4), 
+            size = 6) # climate loadings
+
+#ggsave('results/climate/climatePCA_1-3_gardens2021_provenanceMinisPastFutureArrows.png', height = 8, width = 12)
+
+
+# PC2 and PC3
+
+ggplot(dat = to_plot, aes(x = PC2, y = PC3)) +
+  xlab(paste('PC2 (', round(info$cont$importance['Proportion Explained','PC2'],3)*100, '% variance explained)', sep = '')) +
+  ylab(paste('PC3 (', round(info$cont$importance['Proportion Explained','PC3'],3)*100, '% variance explained)', sep = '')) +
+  geom_vline(xintercept = 0, col = 'grey60') + 
+  geom_hline(yintercept = 0, col = 'grey60') + 
+  geom_line(dat = subset(to_plot, site_type == 'provenance' & in_minis == TRUE), 
+            aes(x = PC2, y = PC3, 
+                group = site_name), 
+            arrow = arrow(ends = 'first', angle = 20, length = unit(0.1, "inches")), col = rgb(0,0,0, alpha = 0.3)) + # arrows
+  geom_point(dat = subset(to_plot[no_fut_minis,], site_type == 'garden' & period == '2021'),
+             aes(x = PC2, y = PC3, fill = site_name), pch = 24, size = 4) +
+  scale_fill_manual(name = 'Garden', values = col_pal) + # plot gardens
+  new_scale_fill() +
+  geom_point(dat = subset(to_plot[no_fut_minis,], site_type == 'provenance'), 
+             aes(x = PC2, y = PC3, fill = Pt), pch = 21, size = 4) + 
+  scale_fill_gradient2(name = '% P. trichocarpa ancestry',
+                       low = 'dodgerblue2', 
+                       mid = 'grey20', 
+                       high = 'darkolivegreen2', 
+                       midpoint = 0.5) + # provenance points (historic)
+  geom_text(data = clims, 
+            label = rownames(clims), 
+            aes(x = PC2/4, y = PC3/4), 
+            size = 6) # climate loadings
+
+#ggsave('results/climate/climatePCA_2-3_gardens2021_provenanceMinisPastFutureArrows.png', height = 8, width = 12)
+
+
+##############################
+
+# 2021 and 2022 for minis
+
+ggplot(dat = to_plot, aes(x = PC1, y = PC2)) +
+  xlab(paste('PC1 (', round(info$cont$importance['Proportion Explained','PC1'],3)*100, '% variance explained)', sep = '')) +
+  ylab(paste('PC2 (', round(info$cont$importance['Proportion Explained','PC2'],3)*100, '% variance explained)', sep = '')) +
+  geom_vline(xintercept = 0, col = 'grey60') + 
+  geom_hline(yintercept = 0, col = 'grey60') + 
+  geom_line(dat = subset(to_plot, site_type == 'provenance' & in_minis == TRUE), 
+            aes(x = PC1, y = PC2, 
+                group = site_name), 
+            arrow = arrow(ends = 'first', angle = 20, length = unit(0.1, "inches")), col = rgb(0,0,0, alpha = 0.3)) + # arrows
+  geom_point(dat = subset(to_plot[no_fut_minis,], site_type == 'garden' & period %in% c('2021', '2022'), ),
+             aes(x = PC1, y = PC2, fill = site_name, shape = period),  size = 4) +
+  scale_shape_manual(name = 'Year', values = c(24,22)) +
+  scale_fill_manual(name = 'Garden', values = col_pal) + # plot gardens
+    guides(shape = guide_legend(order = 1), 
+         fill = guide_legend(order = 2, override.aes = list(shape = 22), ncol = 2)) + # order legends and get garden legend to show correct colors 
+  new_scale_fill() +
+  geom_point(dat = subset(to_plot[no_fut_minis,], site_type == 'provenance'), 
+             aes(x = PC1, y = PC2, fill = Pt), pch = 21, size = 4) + 
+  scale_fill_gradient2(name = "% *P. trichocarpa*<br>ancestry",
+                       low = 'dodgerblue2', 
+                       mid = 'grey20', 
+                       high = 'darkolivegreen2', 
+                       midpoint = 0.5) + # provenance points (historic)
+  theme(legend.title = element_markdown()) +
+  geom_text(data = clims, 
+            label = rownames(clims), 
+            aes(x = PC1/4, y = PC2/4), 
+            size = 6) # climate loadings 
+
+#ggsave('results/climate/climatePCA_1-2_gardens2021-2022_provenanceMinisPastFutureArrows.png', height = 8, width = 12)
+
+
+# PC1 and PC3
+
+ggplot(dat = to_plot, aes(x = PC1, y = PC3)) +
+  xlab(paste('PC1 (', round(info$cont$importance['Proportion Explained','PC1'],3)*100, '% variance explained)', sep = '')) +
+  ylab(paste('PC3 (', round(info$cont$importance['Proportion Explained','PC3'],3)*100, '% variance explained)', sep = '')) +
+  geom_vline(xintercept = 0, col = 'grey60') + 
+  geom_hline(yintercept = 0, col = 'grey60') + 
+  geom_line(dat = subset(to_plot, site_type == 'provenance' & in_minis == TRUE), 
+            aes(x = PC1, y = PC3, 
+                group = site_name), 
+            arrow = arrow(ends = 'first', angle = 20, length = unit(0.1, "inches")), col = rgb(0,0,0, alpha = 0.3)) + # arrows
+  geom_point(dat = subset(to_plot[no_fut_minis,], site_type == 'garden' & period %in% c('2021', '2022'), ),
+             aes(x = PC1, y = PC3, fill = site_name, shape = period),  size = 4) +
+  scale_shape_manual(name = 'Year', values = c(24,22)) +
+  scale_fill_manual(name = 'Garden', values = col_pal) + # plot gardens
+    guides(shape = guide_legend(order = 1), 
+         fill = guide_legend(order = 2, override.aes = list(shape = 22), ncol = 2)) + # order legends and get garden legend to show correct colors 
+  new_scale_fill() +
+  geom_point(dat = subset(to_plot[no_fut_minis,], site_type == 'provenance'), 
+             aes(x = PC1, y = PC3, fill = Pt), pch = 21, size = 4) + 
+  scale_fill_gradient2(name = "% *P. trichocarpa*<br>ancestry",
+                       low = 'dodgerblue2', 
+                       mid = 'grey20', 
+                       high = 'darkolivegreen2', 
+                       midpoint = 0.5) + # provenance points (historic)
+  theme(legend.title = element_markdown()) +
+  geom_text(data = clims, 
+            label = rownames(clims), 
+            aes(x = PC1/4, y = PC3/4), 
+            size = 6) # climate loadings 
+
+#ggsave('results/climate/climatePCA_1-3_gardens2021-2022_provenanceMinisPastFutureArrows.png', height = 8, width = 12)
+
+################################
+# all 544 genotypes, not just those in minis
+
+# PC1 and PC2
+
+ggplot(dat = to_plot, aes(x = PC1, y = PC2)) +
+  xlab(paste('PC1 (', round(info$cont$importance['Proportion Explained','PC1'],3)*100, '% variance explained)', sep = '')) +
+  ylab(paste('PC2 (', round(info$cont$importance['Proportion Explained','PC2'],3)*100, '% variance explained)', sep = '')) +
+  geom_vline(xintercept = 0, col = 'grey60') + 
+  geom_hline(yintercept = 0, col = 'grey60') + 
+  geom_line(dat = subset(to_plot, site_type == 'provenance'), 
+            aes(x = PC1, y = PC2, 
+                group = site_name), 
+            arrow = arrow(ends = 'first', angle = 20, length = unit(0.1, "inches")), col = rgb(0,0,0, alpha = 0.3)) + # arrows
+  geom_point(dat = subset(to_plot, site_type == 'garden' & period == '2021'),
+             aes(x = PC1, y = PC2, fill = site_name), pch = 24, size = 4) +
+  scale_fill_manual(name = 'Garden', values = col_pal) + # plot gardens
+  new_scale_fill() +
+  geom_point(dat = subset(to_plot[no_fut,], site_type == 'provenance'), 
+             aes(x = PC1, y = PC2, fill = Pt), pch = 21, size = 4) + 
+  scale_fill_gradient2(name = '% P. trichocarpa ancestry',
+                       low = 'dodgerblue2', 
+                       mid = 'grey20', 
+                       high = 'darkolivegreen2', 
+                       midpoint = 0.5) + # provenance points (historic)
+  geom_text(data = clims, 
+            label = rownames(clims), 
+            aes(x = PC1/4, y = PC2/4), 
+            size = 6) # climate loadings
+
+#ggsave('results/climate/climatePCA_1-2_gardens2021_provenanceAllPastFutureArrows.png', height = 8, width = 12)
+
+
+# PC1 and PC3
+
+
+ggplot(dat = to_plot, aes(x = PC1, y = PC3)) +
+  xlab(paste('PC1 (', round(info$cont$importance['Proportion Explained','PC1'],3)*100, '% variance explained)', sep = '')) +
+  ylab(paste('PC3 (', round(info$cont$importance['Proportion Explained','PC3'],3)*100, '% variance explained)', sep = '')) +
+  geom_vline(xintercept = 0, col = 'grey60') + 
+  geom_hline(yintercept = 0, col = 'grey60') + 
+  geom_line(dat = subset(to_plot, site_type == 'provenance'), 
+            aes(x = PC1, y = PC3, 
+                group = site_name), 
+            arrow = arrow(ends = 'first', angle = 20, length = unit(0.1, "inches")), col = rgb(0,0,0, alpha = 0.3)) + # arrows
+  geom_point(dat = subset(to_plot, site_type == 'garden' & period == '2021'),
+             aes(x = PC1, y = PC3, fill = site_name), pch = 24, size = 4) +
+  scale_fill_manual(name = 'Garden', values = col_pal) + # plot gardens
+  new_scale_fill() +
+  geom_point(dat = subset(to_plot[no_fut,], site_type == 'provenance'), 
+             aes(x = PC1, y = PC3, fill = Pt), pch = 21, size = 4) + 
+  scale_fill_gradient2(name = '% P. trichocarpa ancestry',
+                       low = 'dodgerblue2', 
+                       mid = 'grey20', 
+                       high = 'darkolivegreen2', 
+                       midpoint = 0.5) + # provenance points (historic)
+  geom_text(data = clims, 
+            label = rownames(clims), 
+            aes(x = PC1/4, y = PC3/4), 
+            size = 6) # climate loadings
+
+#ggsave('results/climate/climatePCA_1-3_gardens2021_provenanceAllPastFutureArrows.png', height = 8, width = 12)
+
+
+```
+

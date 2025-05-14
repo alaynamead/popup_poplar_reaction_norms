@@ -1,0 +1,551 @@
+---
+title: "Map optimal genotypes by climate"
+author: "Alayna Mead"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    toc: true
+    number_sections: true
+    highlight: rstudio
+---
+
+Using reaction norms modeled in the 'transfer_function_multiyear_linear_mixed_effects_model.Rmd' script, identify the genotype having highest growth (taking into account mortality probability) across the sampled hybrid zone under historic and future values of MCMT. Maps show where the 'optimal' genotype/species ancestry could shift spatially under future temperatures, resulting in spatial shifts in the location of the hybrid zone.
+
+# Setup
+
+## Load packages and data
+```{r maps_setup}
+
+library(sf) # mapping
+library(terra) # mapping
+library(RColorBrewer) # colors
+library(circlize) # colorRamp2
+
+# predictions of growth and mortality across climate for each genotype
+load('results/model_prediction/predictedGrowth_acrossClimates_byGenotype_garden_MCMT_2021-2022.Rdata')
+# rename
+preds <- predictions
+rm(predictions)
+
+# make genotype info its own df
+geno.info <- preds$genotypes
+#cleanup
+geno.info$genotype <- rownames(geno.info)
+rownames(geno.info) <- paste('genotype_', rownames(geno.info), sep = '')
+
+
+# garden data
+load('data/clean/garden_climates_average1961-1990_yearly2020-2023.Rdata')
+gards <- clim
+
+# provenance data
+# extract from garden climate and phenotype origin data - named 'dat'
+load('data/clean/mini_garden_phenotypic_and_climate_data_2021-2023.Rdata')
+# get first instance of genotype, extract genotype info
+provs <- dat[! duplicated(dat$Genotype), c("Genotype", "Pb", "Pt", 
+"transect", "provenance_latitude", "provenance_longitude", "provenance_elevation_m")]
+# remove NA genotype
+provs <- provs[! is.na(provs$Genotype),]
+# remove genotypes without genetic data
+provs <- provs[! is.na(provs$Pt),]
+
+# change rownames to genotypes
+rownames(provs) <- provs$Genotype
+
+sessionInfo()
+
+```
+
+```{r markdown_settings}
+
+knitr::opts_chunk$set(fig.width = 12, 
+                      fig.height = 10)
+
+```
+
+## Setup genotype info
+
+```{r genotype_info}
+
+# get additional genotype info
+
+# get first instances of each genotype
+genos <- dat[match(geno.info$genotype, dat$Genotype),]
+
+# check for match
+cbind(as.character(genos$Genotype), geno.info$genotype)
+
+# add to dataframe
+geno.info$transect <- genos$transect
+geno.info$interspecific_heterozygosity <- genos$interspecific_heterozygosity
+geno.info$heterozygosity <- genos$heterozygosity
+geno.info$hybrid_index <- genos$hybrid_index
+geno.info$plastid_ID <- genos$plastid_ID
+geno.info$Pt <- genos$Pt
+geno.info$color_Pt <- genos$color_Pt
+geno.info$color_k3 <- genos$color_k3
+
+str(geno.info)
+
+```
+
+
+## Merge genotype responses
+
+Merge each genotype's response to MCMT into one dataframe for comparison across genotypes
+
+```{r merge_genotypes_predictions}
+
+# get the overall predictions by genotype and join into one dataframe to identify optimal genotype for each climate
+
+# get first genotype
+pred.overall <- preds$overall[[1]]
+
+# rename column
+colnames(pred.overall)[2] <- names(preds$overall)[1]
+
+
+# loop through other genotypes and add them
+for(n in 2:length(preds$overall)){
+  
+  df <- preds$overall[[n]]
+  
+  pred.overall[,names(preds$overall)[n]] <- df[,2]
+  
+}
+
+head(pred.overall)
+
+# which genotype has highest predicted success for each value of MCMT (row)?
+
+# just get genotypes
+tmp <- pred.overall[,-1]
+
+
+pred.overall$best_genotype <- sapply(1:nrow(tmp), function(x) names(which.max(tmp[x,])))
+
+# get genotype colors
+pred.overall$best_genotype_col_Pt <- geno.info[pred.overall$best_genotype, 'color_Pt']
+pred.overall$best_genotype_col_k3 <- geno.info[pred.overall$best_genotype, 'color_k3']
+
+pred.overall$best_genotype <- gsub('genotype_', '', pred.overall$best_genotype)
+
+# quick plot to check
+plot(pred.overall$garden_clim, col = pred.overall$best_genotype_col_Pt, pch = 16)
+plot(pred.overall$garden_clim, col = pred.overall$best_genotype_col_k3, pch = 16)
+
+# list 'best' genotype
+cbind(pred.overall$garden_clim, pred.overall$best_genotype)
+
+# save
+# save(pred.overall, file = 'results/model_prediction/genotypePredictedHeights_byGardenMCMT.Rdata')
+# write.csv(pred.overall, file = 'results/model_prediction/genotypePredictedHeights_byGardenMCMT.csv', row.names = F)
+
+```
+
+## Load climate rasters
+
+Load future and historic MCMT raster files
+
+ClimateNA raster files used here are available from DataBasin:
+
+https://adaptwest.databasin.org/pages/adaptwest-climatena/
+
+Species range shapefiles are from Little 1971 and are available from DataBasin:
+
+P. balsamifera: https://databasin.org/datasets/91380e091ca048359a66fc65962ed210/
+
+P. trichocarpa: https://databasin.org/datasets/84e47784fe2a463c8b292007fb43f2cd/
+
+```{r get_climate}
+
+# which climate variable is being used? 
+clim_var <- 'MCMT'
+# calculate 2-year average, used in model
+dat$garden_MCMT_2020_2021_avg <- (dat$garden_MCMT_2020 + dat$garden_MCMT_2021)/2
+gard_clim_colname <- 'garden_MCMT_2020_2021_avg'
+
+# get historic and future climate
+
+hist <- rast(paste('data/climate/climateNA/Normal_1961_1990/Normal_1961_1990_bioclim/Normal_1961_1990_', clim_var, '.tif', sep = ''))
+crs(hist, proj = T)
+
+hist91 <- rast(paste('data/climate/climateNA/Normal_1991_2020/Normal_1991_2020_', clim_var, '.tif', sep = ''))
+crs(hist, proj = T)
+
+fut8 <- rast(paste('data/climate/climateNA/future/ensemble_8GCMs_ssp245_2041_2070_bioclim/ensemble_8GCMs_ssp245_2041_2070_', clim_var, '.tif', sep = ''))
+
+fut13 <- rast(paste('data/climate/climateNA/future/ensemble_13GCMs_ssp245_2041_2070_bioclim/ensemble_13GCMs_ssp245_2041_2070_', clim_var, '.tif', sep = ''))
+
+################ convert coords
+
+# convert coords to crs of climateNA
+crs.cna <- crs(hist, proj = T)
+
+# provenance coordinates
+coords.prov <- st_as_sf(provs[,c("provenance_longitude", "provenance_latitude")], coords = c(1,2), crs = st_crs(4326))
+coords.prov.cna <- st_transform(coords.prov$geometry, crs = crs.cna)
+
+# garden coordinates
+coords.gards <- st_as_sf(gards[,c("Longitude", "Latitude")], coords = c(1,2), crs = st_crs(4326))
+coords.gards.cna <- st_transform(coords.gards$geometry, crs = crs.cna)
+
+# load shapefile of state/province borders
+borders <- read_sf('data/shapefiles/NorthAmerica_PoliticalBoundaries_Shapefile/NA_PoliticalDivisions/data/bound_p/boundaries_p_2021_v3.shp')
+borders <- st_transform(borders, crs = crs.cna)
+# simplify to 1 km
+borders <- st_simplify(borders, dTolerance = 1000)
+
+# species rangemaps
+# shapefile
+balsam <- st_read('data/shapefiles/Pbal_shapefile/data/commondata/data0/popubals.shp')
+tricho <- st_read('data/shapefiles/Ptri_shapefile/data/commondata/data0/poputric.shp')
+
+# convert CRS
+balsam <- st_transform(balsam, crs.cna)
+tricho <- st_transform(tricho, crs.cna)
+
+# test plot
+plot(hist)
+
+plot(balsam$geometry, add = T, border = 'navy')
+plot(tricho$geometry, add = T, border = 'grey50')
+plot(borders$geometry, add = T)
+
+
+```
+
+# Mapping (color by species ancestry)
+
+## Functions
+
+```{r map_best_geno_functions}
+
+# function for plotting
+map_best_geno <- function(raster, raster_name, save = F, ...){
+  
+  if(save == T){
+    png(file = paste('results/model_prediction/best_genotype_2yearModel_mapped_by_', clim_var, '_', raster_name, '.png', sep = ''),
+   height = 8, width = 8, res = 300, units = 'in')
+  }
+  
+  
+  plot(raster,
+       pax = list(side=NA),
+       colNA = 'white',
+       ...)
+  
+  plot(borders$geometry, add = T, lwd = 0.5)
+  plot(balsam$geometry, add = T, border = 'navy')
+  plot(tricho$geometry, add = T, border = 'darkgreen')
+  plot(coords.prov.cna, add = T, lwd = 2, bg = geno.info$color_Pt, pch = 21, cex = 1.5)
+  plot(coords.gards.cna, add = T, pch = 17, cex = 2)
+  
+  # legend(-3e6, -1.8e6, 
+  #        pch = c(22,22,21,24),
+  #        pt.cex = 2,
+  #        xjust = 0.5,
+  #        pt.bg =  c('darkgreen', 'navy', 'white','white'), 
+  #        legend = c(substitute(paste(italic('P. trichocarpa'), ' range')), 
+  #                   substitute(paste(italic('P. balsamifera'), ' range')),
+  #                   'Collection Site',
+  #                   'Common Garden Site'))
+  
+    legend(-3e6, -1.8e6, 
+         pch = c(22,22,21,24),
+         pt.cex = 2,
+         xjust = 0.5,
+         col =  c('darkgreen', 'navy', 'black','black'), 
+         pt.lwd = 2,
+         pt.bg = c('white', 'white', 'white', 'white'),
+         legend = c(substitute(paste(italic('P. trichocarpa'), ' range')), 
+                    substitute(paste(italic('P. balsamifera'), ' range')),
+                    'Collection Site',
+                    'Common Garden Site'))
+  
+  
+  
+  # add inset legend for species ancestry gradient
+  # https://stackoverflow.com/questions/13355176/gradient-legend-in-base
+  
+  # get breaks for legend labels from color palette
+  pal_range <- range(attr(colf.pt, 'breaks'))
+  pal_min <- pal_range[1]
+  pal_max <- pal_range[2]
+  
+  legend_image <- as.raster(matrix(colf.pt(seq(pal_max, pal_min, length = 100)), ncol=1))
+  
+  # look at NDC coords
+  grconvertX(seq(-4e6, 3e6, 1000000), from = 'user', to = 'ndc')
+  grconvertY(seq(-3e6, 4e6, 1000000), from = 'user', to = 'ndc')
+  
+  figSet <- c(0.1, 0.4, 0.15, 0.5)
+  op <- par(  ## set and store par
+    fig=figSet,    ## set figure region, 
+    mar=c(1, 1, 1, 9.5),                                  ## set margins
+    new=TRUE)                                ## set new for overplot w/ next plot
+  
+  plot(0,0, type='n', axes=F, xlab='', ylab='')  ## ini plot2
+  rasterImage(legend_image, 0, 0, 1, 1)                       ## the gradient
+  lbsq <- seq.int(0, 1, l=5)                                  ## seq. for labels
+  axis(4, at=lbsq, pos=1, labels=F, col=0, col.ticks=1, tck=-.1)  ## axis ticks
+  mtext(lbsq, 4, 0.3, at=lbsq, las=2, cex=.8)                    ## tick labels
+  
+  mtext(expression(atop('Best-performing\ngenotype', italic('(% P. trichocarpa)'))), side=3, line=0.2, cex=1, adj=.1)          ## legend title
+  
+  par(op)  ## reset par
+  
+  
+  if(save == T){
+    dev.off()
+  }
+}
+
+######################################
+# inset zoomed to collection sites
+
+
+# function
+map_best_geno_crop <- function(raster, raster_name, save = F, ...){
+  
+  if(save == T){
+    png(file = paste('results/model_prediction/best_genotype_2yearModel_mapped_by_', clim_var, '_inset_', raster_name, '.png', sep = ''),
+   height = 8, width = 6, res = 300, units = 'in')
+  }
+  
+  
+  plot(raster,
+       pax = list(side=NA),
+       colNA = 'white',
+       ...)
+  
+  plot(borders$geometry, add = T, lwd = 0.5)
+  plot(balsam$geometry, add = T, border = 'navy')
+  plot(tricho$geometry, add = T, border = 'darkgreen')
+  plot(coords.prov.cna, add = T, lwd = 2, bg = geno.info$color_Pt, pch = 21, cex = 2)
+  
+  # legend(-3e6, -1.8e6, 
+  #        pch = c(22,22,21,24),
+  #        pt.cex = 2,
+  #        xjust = 0.5,
+  #        pt.bg =  c('darkgreen', 'navy', 'white','white'), 
+  #        legend = c(substitute(paste(italic('P. trichocarpa'), ' range')), 
+  #                   substitute(paste(italic('P. balsamifera'), ' range')),
+  #                   'Collection Site',
+  #                   'Common Garden Site'))
+  
+  if(save == T){
+    dev.off()
+  }
+  
+}
+  
+```
+
+
+## Plot
+
+```{r plot}
+
+# color scale - used in legend
+colf.pt <- colorRamp2(c(0,0.5,1), colors = c('dodgerblue2', 'grey20', 'darkolivegreen2'))
+
+# assign color of 'optimal' genotype to each temperature bin using coltab 
+cols <- cbind(pred.overall$garden_clim, pred.overall$best_genotype_col_Pt)
+head(cols)
+
+# set raster colors
+coltab(hist) <- cols
+coltab(hist91) <- cols
+coltab(fut8) <- cols
+coltab(fut13) <- cols
+
+# make values outside prediction range (common gardens) NA
+# get the range of actual garden climates that were tested
+pred_clim <- c(dat$garden_MCMT_2021, dat$garden_MCMT_2022)
+
+msk <- ifel(hist > max(pred_clim) | hist < min(pred_clim), NA, 1)
+hist.mask <- mask(hist, msk)
+plot(hist.mask, colNA = 'grey')
+
+hist91.mask <- mask(hist91, msk)
+plot(hist91.mask, colNA = 'grey')
+
+# future climate
+
+# make values outside predict range NA
+msk <- ifel(fut13 > max(pred_clim) | fut13 < min(pred_clim), NA, 1)
+fut13.mask <- mask(fut13, msk)
+plot(fut13.mask, colNA = 'grey')
+
+msk <- ifel(fut8 > max(pred_clim) | fut8 < min(pred_clim), NA, 1)
+fut8.mask <- mask(fut8, msk)
+plot(fut8.mask, colNA = 'grey')
+
+# are we saving plots?
+save = FALSE
+
+# Maps!
+
+# plot full range
+map_best_geno(hist.mask, raster_name = 'historic', main = '1961-1990', save = save)
+map_best_geno(hist91.mask, raster_name = '1991-2020', main = '1991-2020', save = save)
+map_best_geno(fut13.mask, raster_name = '2041-2070_13GCMs', main = '2041-2070 (13 GCM ensemble)', save = save)
+map_best_geno(fut8.mask, raster_name = '2041-2070_8GCMs', main = '2041-2070 (8 GCM ensemble)', save = save)
+
+
+# crop rasters, then plot
+extent <- ext(-26e5, -5e5, 45e4, 3e6)
+hist.crop <- crop(hist.mask, extent)
+hist91.crop <- crop(hist91.mask, extent)
+fut8.crop <- crop(fut8.mask, extent)
+fut13.crop <- crop(fut13.mask, extent)
+
+map_best_geno_crop(hist.crop, main = '1961-1990', save = save, raster_name = 'historic')
+map_best_geno_crop(hist91.crop, raster_name = '1991-2020', main = '1991-2020', save = save)
+map_best_geno_crop(fut8.crop, main = '2041-2070 (8 GCM ensemble)', save = save, raster_name = '2041-2070_8GCMs')
+map_best_geno_crop(fut13.crop, main = '2041-2070 (13 GCM ensemble)', save = save, raster_name = '2041-2070_13GCMs')
+
+
+# crop to western interior region
+
+extent <- ext(-15e5, 1e5, -10e5, 1e6)
+hist.crop <- crop(hist.mask, extent)
+hist91.crop <- crop(hist91.mask, extent)
+fut8.crop <- crop(fut8.mask, extent)
+fut13.crop <- crop(fut13.mask, extent)
+
+map_best_geno_crop(hist.crop, main = '1961-1990', save = save, raster_name = 'west_historic')
+map_best_geno_crop(hist91.crop, raster_name = 'west_1991-2020', main = '1991-2020', save = save)
+map_best_geno_crop(fut8.crop, main = '2041-2070 (8 GCM ensemble)', save = save, raster_name = 'west_2041-2070_8GCMs')
+map_best_geno_crop(fut13.crop, main = '2041-2070 (13 GCM ensemble)', save = save, raster_name = 'west_2041-2070_13GCMs')
+
+
+```
+
+# Mapping (color by K=3)
+
+Here, color by ancestry based on admixture with K=3 (separating tricho into a coastal and interior lineage). Colors for each genotype are calculated as RGB values with blue = balsam, red = interior tricho, and green = coastal tricho.
+
+Did not use these in the manuscript because the tricho/balsam pattern seems to be stronger, and genetic PC2, which separates coastal and interior tricho, was not significant in the model of growth in the common gardens.
+
+## Functions
+
+```{r map_best_color_k3_functions}
+
+# function for plotting
+# comapred to function above, this just removes the ancestry scale
+
+map_best_geno_k3 <- function(raster, raster_name, save = F, ...){
+  
+  if(save == T){
+    png(file = paste('results/model_prediction/best_genotype_2yearModel_colorK3_mapped_by_', clim_var, '_', raster_name, '.png', sep = ''),
+   height = 8, width = 8, res = 300, units = 'in')
+  }
+  
+  
+  plot(raster,
+       pax = list(side=NA),
+       colNA = 'white',
+       ...)
+  
+  plot(borders$geometry, add = T, lwd = 0.5)
+  plot(balsam$geometry, add = T, border = 'navy')
+  plot(tricho$geometry, add = T, border = 'darkgreen')
+  plot(coords.prov.cna, add = T, lwd = 2, bg = geno.info$color_k3, pch = 21, cex = 1.5)
+  plot(coords.gards.cna, add = T, pch = 17, cex = 2)
+  
+  legend(-3e6, -1.8e6, 
+         pch = c(22,22,21,24),
+         pt.cex = 2,
+         xjust = 0.5,
+         pt.bg =  c('darkgreen', 'navy', 'white','white'), 
+         legend = c(substitute(paste(italic('P. trichocarpa'), ' range')), 
+                    substitute(paste(italic('P. balsamifera'), ' range')),
+                    'Collection Site',
+                    'Common Garden Site'))
+  
+  
+  if(save == T){
+    dev.off()
+  }
+}
+
+
+# inset / zoomed
+
+map_best_geno_crop_k3 <- function(raster, raster_name, save = F, ...){
+  
+  if(save == T){
+    png(file = paste('results/model_prediction/best_genotype_2yrModel_colorK3_mapped_by_', clim_var, '_inset_', raster_name, '.png', sep = ''),
+   height = 8, width = 6, res = 300, units = 'in')
+  }
+  
+  
+  plot(raster,
+       pax = list(side=NA),
+       colNA = 'white',
+       ...)
+  
+  plot(borders$geometry, add = T, lwd = 0.5)
+  plot(balsam$geometry, add = T, border = 'navy')
+  plot(tricho$geometry, add = T, border = 'darkgreen')
+  plot(coords.prov.cna, add = T, lwd = 2, bg = geno.info$color_k3, pch = 21, cex = 2)
+  
+  
+  if(save == T){
+    dev.off()
+  }
+}
+```
+
+
+## Plot
+
+```{r plot_k3}
+
+# color by K=3
+cols <- cbind(pred.overall$garden_clim, pred.overall$best_genotype_col_k3)
+
+# set raster colors
+coltab(hist.mask) <- cols
+coltab(hist91.mask) <- cols
+coltab(fut8.mask) <- cols
+coltab(fut13.mask) <- cols
+
+# are we saving plots?
+save = FALSE
+
+# map
+
+map_best_geno_k3(hist.mask, raster_name = 'historic', main = 'Historic (1961-1990)', save = save)
+map_best_geno_k3(hist91.mask, raster_name = '1991-2020', main = '1991-2020', save = save)
+map_best_geno_k3(fut8.mask, raster_name = '2041-2070_8GCMs', main = '2041-2070 (8 GCM ensemble)', save = save)
+map_best_geno_k3(fut13.mask, raster_name = '2041-2070_13GCMs', main = '2041-2070 (13 GCM ensemble)', save = save)
+
+# crop rasters, then plot
+extent <- ext(-26e5, -5e5, 45e4, 3e6)
+hist.crop <- crop(hist.mask, extent)
+hist91.crop <- crop(hist91.mask, extent)
+fut8.crop <- crop(fut8.mask, extent)
+fut13.crop <- crop(fut13.mask, extent)
+
+map_best_geno_crop_k3(hist.crop, main = '1961-1990', save = save, raster_name = 'historic')
+map_best_geno_crop_k3(hist91.crop, raster_name = '1991-2020', main = '1991-2020', save = save)
+map_best_geno_crop_k3(fut8.crop, main = '2041-2070 (8 GCM ensemble)', save = save, raster_name = '2041-2070_8GCMs')
+map_best_geno_crop_k3(fut13.crop, main = '2041-2070 (13 GCM ensemble)', save = save, raster_name = '2041-2070_13GCMs')
+
+# crop to western interior region
+
+extent <- ext(-15e5, 1e5, -10e5, 1e6)
+hist.crop <- crop(hist.mask, extent)
+hist91.crop <- crop(hist91.mask, extent)
+fut8.crop <- crop(fut8.mask, extent)
+fut13.crop <- crop(fut13.mask, extent)
+
+map_best_geno_crop_k3(hist.crop, main = '1961-1990', save = save, raster_name = 'west_historic')
+map_best_geno_crop_k3(hist91.crop, raster_name = 'west_1991-2020', main = '1991-2020', save = save)
+map_best_geno_crop_k3(fut8.crop, main = '2041-2070 (8 GCM ensemble)', save = save, raster_name = 'west_2041-2070_8GCMs')
+map_best_geno_crop_k3(fut13.crop, main = '2041-2070 (13 GCM ensemble)', save = save, raster_name = 'west_2041-2070_13GCMs')
+
+```

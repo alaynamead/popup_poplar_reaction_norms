@@ -1,0 +1,2711 @@
+---
+title: "Predict genotype-specific reaction norms"
+author: "Alayna Mead"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    toc: true
+    number_sections: true
+    highlight: rstudio
+---
+
+Test the effects of home climate, garden climate, and genetics on the growth and mortality responses of hybrid poplars across different common gardens, then predict genotype-specific reaction norms to MCMT. Uses glmmTMB to fit a zero-inflated mixed-effects model.
+
+# Setup
+
+## data and packages
+```{r setup}
+
+library(ggplot2)
+library(colorRamp2)
+library(RColorBrewer)
+library(lme4)
+library(sjPlot) # nice plots of models
+library(glmmTMB) #zero-inflated  model and also used with sjPlot
+library(bbmle) # for AICtab
+library(patchwork) # plot ggplots together
+library(ggpubr) # easily add pvals to ggplots
+library(performance) # for rmse (root mean squared error function)
+library(psych) # for pairs.panels()
+
+# using the merged 2024 dataset because Idaho wasn't included in the old 2023 merged file
+# remove the 2024 data
+load('data/clean/mini_garden_phenotypic_and_climate_data_2021-2024.Rdata')
+dat <- dat[, !endsWith(colnames(dat), '2024')]
+
+str(dat)
+
+# print session info
+sessionInfo()
+
+# ggplot settings
+theme_set(theme_bw() + theme(text=element_text(size=16)))
+
+```
+
+```{r markdown_settings}
+
+knitr::opts_chunk$set(fig.width = 12, 
+                      fig.height = 10)
+
+```
+
+## Clean up input data
+
+Set the growth increment to 0 for all trees that died and didn't have a growth increment value. This is needed to include both growth and mortality measures within the same model; it is zero-inflated to evaluate the zeros arising from mortality separately.
+
+```{r cleanup_set_dead_to_0}
+
+# dead trees should have a growth of zero if they were dead the whole year
+# some trees died during the season and their height was still recorded - keep these  values since it represents real growth and should be related to fitness
+
+
+# how many of these trees are there?
+length(which(dat$Survival_09_2021 == 0 & is.na(dat$GrowthIncrement_2021))) # 336
+length(which(dat$Survival_09_2022 == 0 & is.na(dat$GrowthIncrement_2022))) # 324
+length(which(dat$Survival_09_2023 == 0 & is.na(dat$GrowthIncrement_2023))) # 337
+
+# change these growth values from NA to 0
+dat[which(dat$Survival_09_2021 == 0 & is.na(dat$GrowthIncrement_2021)), 'GrowthIncrement_2021'] <- 0
+dat[which(dat$Survival_09_2022 == 0 & is.na(dat$GrowthIncrement_2022)), 'GrowthIncrement_2022'] <- 0
+dat[which(dat$Survival_09_2023 == 0 & is.na(dat$GrowthIncrement_2023)), 'GrowthIncrement_2023'] <- 0
+
+
+# save a list of which trees are alive at the end of each year
+# used later to exclude dead trees when evaluating conditional model
+alive21 <- rownames(dat)[dat$Survival_09_2021 == 1 & ! is.na(dat$Survival_09_2021)]
+alive22 <- rownames(dat)[dat$Survival_09_2022 == 1 & ! is.na(dat$Survival_09_2022)]
+alive23 <- rownames(dat)[dat$Survival_09_2023 == 1 & ! is.na(dat$Survival_09_2023)]
+
+nrow(dat)
+length(alive21)
+length(alive22)
+length(alive23)
+
+# how many trees have values of zero growth?
+sum(dat$GrowthIncrement_2021 == 0, na.rm = T) # 381
+sum(dat$GrowthIncrement_2022 == 0, na.rm = T) # 343
+sum(dat$GrowthIncrement_2023 == 0, na.rm = T) # 370
+
+# total number of trees that are not NA
+sum(! is.na(dat$GrowthIncrement_2021)) # 1476
+sum(! is.na(dat$GrowthIncrement_2022)) # 1234
+sum(! is.na(dat$GrowthIncrement_2023)) # 1133
+
+
+# note: 'total_growth_increment_2021_2022' has already been calculated in cleanup script. The NAs for dead trees mean that the total growth increment will also (correctly) be an NA if the tree died during one of the years. Don't recalculate total growth increment here - if growth for one year was a 0 because it was dead, multi-year growth would sum to an actual number and would not be left out of the analysis, as it is when the value is NA.
+# total_growth_increment summed across years is no longer used in this script, but I'll leave this note here in case that changes
+
+```
+
+```{r cleanup_remove_NA_genotypes}
+
+# remove NA genotypes
+
+dat <- dat[! is.na(dat$Genotype),]
+
+table(dat$Genotype) 
+length(table(dat$Genotype)) # 47 genotypes
+
+```
+
+## Save input data
+
+```{r save_input_data}
+
+# save(dat, file = 'data/clean/mini_garden_phenotypic_and_climate_data_2021-2023_deadHeight0_removeNegativeGrowth.Rdata')
+# write.csv(dat, file = 'data/clean/mini_garden_phenotypic_and_climate_data_2021-2023_deadHeight0_removeNegativeGrowth.csv')
+
+```
+
+
+# Functions
+
+```{r functions}
+
+# function to calculate correlation between predicted and observed values for a model (essentially the R value)
+
+# mod is the model
+# it pulls the dataset from the model object, which allows us to remove rows with NAs for just the variables used in this model
+# re.form argument goes to predict(); to include random effects set to NULL, to set random effects to zero set to NA
+# 'alive' is the list of individual trees that are alive and needs to be defined in the environment - it's set up in 'setup_choose_model_variables' chunk
+
+model_R <- function(mod, type = 'response', re.form = NULL, se.fit = FALSE){
+  
+  # get dataframe with all variables used in model
+  df <- mod$frame
+  
+  # first column is phenotype
+  colnames(df)[1] <- 'pheno'
+  
+  # make new dataframe with no NA values
+  # not necessary when using dataframe from model output
+  #noNA <- df[complete.cases(df),]
+
+  
+  # predict phenotype (generally height)
+  df$pred <- predict(mod, type = type, re.form = re.form, se.fit = se.fit)
+  
+  # un-log-transform height
+  df$pred <- exp(df$pred) - 1
+  df$pheno <- exp(df$pheno) - 1
+  
+  # if type = conditional, remove dead trees (which are modeled separately in zero-inflated model)
+  if(type == 'conditional'){
+    df <- df[alive,]
+  }
+  
+  # calculate correlation between actual and predicted values
+  cor <- cor.test(df$pheno, df$pred)
+  
+  return(list(actual = df$pheno, predicted = df$pred, cor = cor, data_noNAs = df))
+  
+}
+
+# plot actual vs predicted values and prints the correlation and p-value using the output of model_R as 'input' argument
+
+plot_predicted_vs_actual <- function(input, title = NULL, col = rgb(0,0,0,0.1), col_1to1 = 'red', col_fit = 'blue', legend = TRUE){
+  
+  pval <- round(input$cor$p.value, 4)
+  cor_est <- as.numeric(round(input$cor$estimate, 3))
+  main <- paste(title, '\n', 'R = ', cor_est, ' | p = ', pval, sep = '')
+  
+  plot(input$actual, input$predicted, 
+       pch = 16, 
+       col = col, 
+       xlab = "Height (actual)", 
+       ylab = "Height (predicted)",
+       title(main, adj = 0))
+  abline(0, 1, col = col_1to1, lty = 2) # 1to1 line
+  abline(lm(input$predicted ~ input$actual), col = col_fit) # fit line
+  
+  # add text
+  if(legend == TRUE){
+    legend('bottomright', fill = c(col_1to1, col_fit), legend = c('1:1 line', 'Best fit'))
+  }
+}
+
+
+#######
+# for plotting actual mortality vs mortality probability - need logistic model
+# this reports the correct statistics but the plot function just uses a linear line - should be changed to a binomial model
+# but this is okay for a quick look
+
+
+model_R_mortality <- function(mod, re.form = NULL, se.fit = TRUE){
+  
+  # setup
+  # include random effects in predictions or set random effects to zero?
+  # this is the re.form argument in predict()
+  #re.form <- ifelse(include_REs == TRUE, eval(NULL), NA)
+  
+  df <- mod$frame
+  
+  # first column is phenotype
+  colnames(df)[1] <- 'pheno'
+  
+  # make new dataframe with no NA values
+  # not necessary when using dataframe from model output
+  noNA <- df[complete.cases(df),]
+
+  
+  # predict phenotype - here, probability of mortality
+  df$pred <- predict(mod, type = 'zprob', re.form = re.form, se.fit = se.fit)
+  
+  # un-log-transform actual height
+  df$pheno <- exp(df$pheno) - 1
+  
+  # convert growth increment to binary 0/1
+  # if value is not 0, convert to 1
+  df$alive <- ifelse(df$pheno == 0, 0, 1)
+  
+  # logistic model
+  mort <- glm(alive ~ pred, family = 'binomial', data = df)
+  
+  # this really should be a logistic fit not linear, but using this for now
+  cor <- cor.test(df$alive, df$pred)
+  
+  return(list(actual = df$alive, predicted = df$pred, cor = cor, data_noNAs = noNA))
+  
+}
+
+plot_predicted_vs_actual_mortality <- function(input, title = NULL, col = rgb(0,0,0,0.1), col_1to1 = 'red', col_fit = 'blue'){
+  
+  pval <- round(input$cor$p.value, 4)
+  cor_est <- as.numeric(round(input$cor$estimate, 3))
+  main <- paste(title, '\n', 'R = ', cor_est, ' | p = ', pval, sep = '')
+  
+  plot(input$actual, input$predicted, 
+       pch = 16, 
+       col = col, 
+       xlab = "Mortality (actual)", 
+       ylab = "Probability of mortality",
+       title(main, adj = 0))
+  #abline(0, 1, col = col_1to1, lty = 2) # 1to1 line
+  abline(lm(input$predicted ~ input$actual), col = col_fit) # fit line
+  
+  # add text
+  
+ # legend('bottomright', fill = c(col_1to1, col_fit), legend = c('1:1 line', 'Best fit'))
+  
+}
+
+# compare the distribution of residuals among multiple models
+plot_resid <- function(mods, ...){
+  
+  
+  # mods should be a named list of model outputs
+  
+  # set colors - cols25() with some similar colors removed
+  cols <- c("#1F78C8", "#ff0000", "#33a02c", "#6A33C2", "#ff7f00", "#FFD700", "#a6cee3", "#FB6496", "#b2df8a", "#CAB2D6", "#FDBF6F", "#999999", "#EEE685", "#C8308C", "#FF83FA", "#C814FA", "#0000FF", "#36648B", "#00E2E5", "#00FF00", "#778B00", "#BEBE00", "#8B3B00", "#A52A3C")
+  
+  
+  par(mfrow = c(1,3))
+  
+  # calculate residuals for all models
+  res <- list()
+  for(n in 1:length(mods)){
+    res[[n]] <- residuals(mods[[n]])
+  }
+  
+  ##############################
+  # version with transformed residuals (from log scale to cm)
+  res.cm <- list()
+  for(n in 1:length(res)){
+    res.cm[[n]] <- exp(res[[n]])-1
+  }
+  # plot first one
+  # ugly code to get the max value for y axis
+  ymax <- max(sapply(1:length(res.cm), FUN =  function(x) max(density(res.cm[[x]])$y)))
+  plot(density(res.cm[[1]]), col = cols[1], ylim = c(0, ymax), main = 'residuals in cm')
+  abline(v = mean(res.cm[[1]]), col = cols[1])
+  # add the rest
+  for(n in 2:length(mods)){
+    # get residuals and un-log-transfrom
+    lines(density(res.cm[[n]]), col = cols[n])
+    abline(v = mean(res.cm[[n]]), col = cols[n])
+  }
+  
+  abline(v = 0, lty = 2)
+  legend('topright', 
+         legend = names(mods),
+         fill = cols[1:length(mods)])
+  
+  #####################################
+  # untransformed (log scale) version
+  
+  # ugly code to get the max value for y axis
+  ymax <- max(sapply(1:length(res), FUN =  function(x) max(density(res[[x]])$y)))
+  
+  # plot first one
+
+  plot(density(res[[1]]), col = cols[1], main = 'log-transformed residuals', ylim = c(0,ymax))
+  abline(v = mean(res.cm[[1]]), col = cols[1])
+  # add the rest
+  for(n in 2:length(mods)){
+    lines(density(res[[n]]), col = cols[n])
+    abline(v = mean(res.cm[[n]]), col = cols[n])
+  }
+  
+  abline(v = 0, lty = 2)
+  legend('topright', 
+         legend = names(mods),
+         fill = cols[1:length(mods)])
+  
+  ########################################
+  # use absolute value to compare how "wrong" each model is without regard to over/underestimation
+  
+  # calc absolute values
+  res.abs <- list()
+  for(n in 1:length(res)){
+    res.abs[[n]]<- abs(res[[n]])
+  }
+  
+  # ugly code to get the max value for y axis
+  ymax <- max(sapply(1:length(res.abs), FUN =  function(x) max(density(res.abs[[x]])$y)))
+  
+  # plot first one
+  plot(density(res.abs[[1]]), col = cols[1], ylim = c(0, ymax), main = 'absolute log-transformed residuals')
+  abline(v = mean(res.cm[[1]]), col = cols[1])
+  # add the rest
+  for(n in 2:length(mods)){
+    lines(density(res.abs[[n]]), col = cols[n])
+    abline(v = mean(res.cm[[n]]), col = cols[n])
+  }
+  
+  abline(v = 0, lty = 2)
+  legend('topright', 
+         legend = names(mods),
+         fill = cols[1:length(mods)])
+  
+  # reset par
+  par(mfrow = c(1,1))
+  
+}
+
+```
+
+
+# Multi-year Model Setup
+
+## Plot MCMT over three years
+
+```{r plot_climate_variables}
+
+# the MCMT for each year is highly correlated but shows yearly variation
+par(mfrow = c(1,3))
+
+plot(dat$garden_MCMT_2021, dat$garden_MCMT_2020, ylim = c(-16,15))
+abline(0,1, col = 'blue')
+plot(dat$garden_MCMT_2021, dat$garden_MCMT_2022, ylim = c(-16,15))
+abline(0,1, col = 'blue')
+plot(dat$garden_MCMT_2021, dat$garden_MCMT_2023, ylim = c(-16,15))
+abline(0,1, col = 'blue')
+
+
+```
+
+## Select variables and merge years into one dataframe
+
+```{r setup_run_glmTMB_all_years}
+
+# select the climate variables being used and merge growth values from 2021 and 2022 into the same column, adding a random effect for year
+# to run the model using a climate variable other than MCMT, change 'colname' variables here
+# NOT including 2023 data in this script because the loss of extreme warm and cold gardens resulted in weird response curves (eg U-shaped curves with height increasing as temperatures became more extreme)
+# note: some effects included here were used in testing models in previous versions, but are not used in the final model
+
+# make a subset dataframe for 2021
+# we need to include a random effect for the individual (to account for repeated sampling) and for year
+
+# labels
+pheno_label <- 'Growth Increment 2021-2022'
+clim_label <- 'MCMT'
+
+# for 2021
+garden_clim_colname <- 'garden_MCMT_2021'
+home_clim_colname <- 'provenance_MCMT'
+
+# phenotype to use
+pheno_colname <- 'GrowthIncrement_2021'
+
+# setup variables
+
+# set climate and phenotype variables
+garden_clim <- dat[,garden_clim_colname]
+garden_clim_2 <- dat[,garden_clim_colname]^2
+home_clim <- dat[,home_clim_colname]
+home_clim_2 <- dat[,home_clim_colname]^2
+pheno <- dat[,pheno_colname]
+
+# add other random and fixed effects
+block <- as.character(interaction(dat$MiniCG_Site, dat$block, drop = T))
+Pt <- dat$Pt
+indiv <- as.character(dat$Unique_ID)
+genotype <- as.character(dat$Genotype)
+garden <- as.character(dat$MiniCG_Site)
+pc1 <- dat$genetic_PC1
+pc2 <- dat$genetic_PC2
+pc3 <- dat$genetic_PC3
+pc4 <- dat$genetic_PC4
+pc5 <- dat$genetic_PC5
+
+# put in df
+df.21 <- data.frame(pheno, garden_clim, garden_clim_2, home_clim, home_clim_2, Pt, indiv, genotype, garden, block, pc1, pc2, pc3, pc4, pc5)
+df.21$year <- '2021'
+str(df.21)
+
+###################################
+# now do the same for 2022 
+
+garden_clim_colname <- 'garden_MCMT_2022'
+home_clim_colname <- 'provenance_MCMT'
+
+# phenotype to use
+pheno_colname <- 'GrowthIncrement_2022'
+
+
+# setup variables
+
+# set climate and phenotype variables
+garden_clim <- dat[,garden_clim_colname]
+garden_clim_2 <- dat[,garden_clim_colname]^2
+home_clim <- dat[,home_clim_colname]
+home_clim_2 <- dat[,home_clim_colname]^2
+pheno <- dat[,pheno_colname]
+
+# add other random and fixed effects
+block <- as.character(interaction(dat$MiniCG_Site, dat$block, drop = T))
+Pt <- dat$Pt
+indiv <- as.character(dat$Unique_ID)
+genotype <- as.character(dat$Genotype)
+garden <- as.character(dat$MiniCG_Site)
+pc1 <- dat$genetic_PC1
+pc2 <- dat$genetic_PC2
+pc3 <- dat$genetic_PC3
+pc4 <- dat$genetic_PC4
+pc5 <- dat$genetic_PC5
+
+# put in df
+df.22 <- data.frame(pheno, garden_clim, garden_clim_2, home_clim, home_clim_2, Pt, indiv, genotype, garden, block, pc1, pc2, pc3, pc4, pc5)
+df.22$year <- '2022'
+str(df.22)
+
+# cleanup 2022
+# remove the gardens that weren't measured in 2022
+df.22 <- df.22[df.22$garden %in% levels(dat$MiniCG_Site_2022),]
+# remove NWMO, which is missing preflush heights
+df.22 <- df.22[! df.22$garden %in% 'NWMO',]
+# remove trees that were dead in both 2021 and 2022
+dead <- rownames(dat)[dat$Survival_09_2021 == 0 & dat$Survival_09_2022 == 0]
+df.22 <- df.22[! df.22$indiv %in% dead,]
+
+
+######################################
+# combine 2021 and 2022
+df <- merge(df.21, df.22, all = T )
+str(df)
+
+# add rownames and get list of alive individuals for each year
+rownames(df) <- paste(df$indiv, df$year, sep = '_')
+
+
+alive <- c(paste(alive21, '_2021', sep = ''),
+           paste(alive22, '_2022', sep = ''))
+
+dim(df)
+dim(df[alive,])
+
+#checks
+
+# look at growth increment
+par(mfrow = c(1,2))
+hist(df$pheno)
+hist(log(df$pheno + 1))
+
+# variation across gardens/years
+par(mfrow = c(1,1), mar = c(10,4,4,3))
+boxplot(df$pheno~ df$year * df$garden, las = 2, xlab = '', col = c('lightblue', 'dodgerblue3'))
+
+#check climate - make sure home/garden climate was assigned correctly
+boxplot(df$garden_clim ~ df$year * df$garden, las = 2, xlab = '', col = c('lightblue', 'dodgerblue3'), drop = T)
+boxplot(df$home_clim ~ df$year * df$garden, las = 2, xlab = '', col = c('lightblue', 'dodgerblue3'), drop = T)
+
+boxplot(df$home_clim ~ df$genotype, las = 2, xlab = '')
+
+# reset colnames - these get used for labeling outputs later
+garden_clim_colname <- 'garden_MCMT_2021-2022'
+home_clim_colname <- 'provenance_MCMT'
+pheno_colname <- 'GrowthIncrement_2021-2022'
+
+# check correlations among variables
+pairs.panels(df, scale = T)
+
+```
+
+
+## Scale variables
+
+
+```{r models_with_scaled_variables_setup}
+
+# scale variables - having them on a similar scale improves model convergence. Previously got warnings about variables being on different scales.
+
+dput(colnames(df))
+
+# just scale numeric variables, then re-combine
+
+
+# don't center - this means scale factor will be the same for each variable (column) so back-transforming is easier
+orig <- df[,c("garden_clim", "garden_clim_2", "home_clim", "home_clim_2", "Pt", "pc1", "pc2", "pc3", "pc4", "pc5")]
+scaled <- scale(orig, center = F)
+
+# merge
+df.scaled <- data.frame(df[, c('pheno', 'genotype', 'garden', 'block', 'indiv', 'year')], scaled)
+
+# plot
+pairs(df.scaled[,c("pheno", "garden_clim", "garden_clim_2", "home_clim", "home_clim_2", "Pt", "pc1", "pc2", "pc3", "pc4", "pc5")])
+
+# get scale factors for back-transforming
+summary(scaled/orig)
+
+# get and save the first line (which is the same for all rows in a column)
+# convert real data to scaled data: orig * scaling_factor
+# convert scaled data to real data: scaled/scaling_factor
+scaled_orig_df <- scaled/orig
+scaling_factor <- as.vector(scaled_orig_df[1,])
+
+```
+
+
+
+# Run multiyear models
+
+## Compare setting year as a fixed vs random effect
+
+Fit a zero-inflated model predicting growth (conditional) and mortality (zero-inflated) for each individual based on garden MCMT, home MCMT, their square terms (accounting for parabolic response to temperature), genetic structure represented by genetic PCs 1-3, and interaction effects between genetic PCs and garden environment (GxE) and home climate and garden environment (GxE when home climate is a proxy for genetic variation due to adaptation).
+
+This section compares setting year as a fixed effect vs random effect.
+
+```{r compare_multiyear_models}
+
+
+# info about repeated measures
+# https://stackoverflow.com/questions/63360751/specifying-random-effects-for-repeated-measures-in-logistic-mixed-model-in-r-lm
+# https://academic.oup.com/treephys/article/37/1/33/2527789#58152734
+
+
+# set up list to save different models to for comparison
+mods <- list()
+
+# year as RE, individual as separate RE
+# used this one for the final version!
+
+mods$year_indiv_RE <- glmmTMB(log(pheno + 1) ~ garden_clim*home_clim + garden_clim_2*home_clim_2  + garden_clim_2 * home_clim + home_clim_2* garden_clim +  pc1*garden_clim + pc2*garden_clim + pc3*garden_clim + pc1*garden_clim_2 + pc2*garden_clim_2 + pc3*garden_clim_2 +
+                      (1 | genotype) + (1 | garden/block) +(1 | year) + (1 | indiv),
+               data = df.scaled,
+               family = gaussian(),
+               ziformula = ~.)
+
+summary(mods$year_indiv_RE)
+
+plot_model(mods$year_indiv_RE, type = 'std', vline.color = "black", show.values = T) +
+   theme(text=element_text(size=16)) + 
+  ggtitle('multiyear test')
+
+plot_model(mods$year_indiv_RE, type = 're', 
+                  sort.est = 'sort.all', 
+                  grid = F, 
+                  vline.color = 'black', 
+                  wrap.title = 20, wrap.labels = 20)
+
+
+# use genotype as  RE
+# year as FE
+mods$yearFE_indivRE <- glmmTMB(log(pheno + 1) ~ garden_clim*home_clim + garden_clim_2*home_clim_2  + garden_clim_2 * home_clim + home_clim_2* garden_clim 
+                    + pc1 + pc2 + pc3 + pc1*garden_clim + pc2*garden_clim + pc3*garden_clim + pc1*garden_clim_2 + pc2*garden_clim_2 + pc3*garden_clim_2 + 
+                      year +
+                      (1 | genotype) + (1 | garden/block) + (1 | indiv),
+               data = df.scaled, 
+               family = gaussian(), 
+               ziformula = ~.)
+
+
+summary(mods$yearFE_indivRE)
+
+plot_model(mods$yearFE_indivRE, type = 'std', vline.color = "black", show.values = T) +
+   theme(text=element_text(size=16)) + 
+  ggtitle('multiyear test')
+
+
+
+# compare models
+plot_models(mods, std.est = T, vline.color = "black", show.values = F, p.shape = T, m.labels = names(mods))
+
+mods.yrs <- list()
+
+
+par(mar = c(5,4,4,3), mfrow = c(2,2))
+for(n in 1:length(mods)){
+  
+  mod <- mods[[n]]
+  
+  # overall model
+  plot_predicted_vs_actual(model_R(mod, re.form = NULL), title = paste(names(mods)[n], 'overall, with random effects', sep = '\n'))
+  plot_predicted_vs_actual(model_R(mod, re.form = NA), title = 'overall, no random effects')
+  # conditional model (just growth)
+  # with dead trees removed
+  plot_predicted_vs_actual(model_R(mod, re.form = NULL, type = 'conditional'), title = 'conditional, with random effects')
+  plot_predicted_vs_actual(model_R(mod, re.form = NA, type = 'conditional'), title = 'conditional, no random effects')
+  
+}
+
+```
+
+
+```{r save_outputs}
+
+# which model to save?
+mod <- mods$year_indiv_RE
+
+save(mod, df.scaled, scaling_factor,
+     file = paste('results/model_prediction/glmTMB_multiyear_model_outputs_', garden_clim_colname, '_vs_', pheno_colname, '.Rda', sep = ''))
+
+```
+
+# Plots for selected model
+
+```{r model_plots}
+
+# which model to use?
+mod <- mods$year_indiv_RE
+
+# print call
+mod$call
+
+
+# nice model plot using sjPlot
+# see ?plot_model
+# https://github.com/strengejacke/sjPlot/blob/6f57b80824575cc238834551be7270f8ecb19c8c/R/plot_type_est.R#L6
+
+# get names of terms, excluding intercept
+terms <- names(fixef(mod)[[1]][-1])
+labs <- rep(NA, length = length(terms))
+# add labels for the MCMT model
+labs <- c("Garden MCMT", "Home MCMT", "Garden MCMT^2", "Home MCMT^2", "Genetic PC1", "Genetic PC2", "Genetic PC3", "Garden MCMT x Home MCMT", "Garden MCMT^2 x Home MCMT^2", "Garden MCMT^2 x Home MCMT", "Garden MCMT x Home MCMT^2", "Garden MCMT x Genetic PC1", "Garden MCMT x Genetic PC2", "Garden MCMT x Genetic PC3", "Garden MCMT^2 x Genetic PC1", "Garden MCMT^2 x Genetic PC2", "Garden MCMT^2 x Genetic PC3")
+names(labs) <- terms
+
+# check that they match
+labs
+cbind(labs, names(labs))
+
+# reorder effect names 
+ord <- c(1,3,2,4,5:17)
+
+# png(file = paste('results/model_prediction/glmTMB_model_plot_standardized_', garden_clim_colname, '_vs_', pheno_colname, '.png', sep = ''),
+# height = 12,
+# width = 9,
+# res = 300,
+# units = 'in')
+
+plot_model(mod, type = 'std', vline.color = "black", show.values = T, value.offset = 0.4, wrap.labels = 30, dot.size = 2) +
+   theme(text=element_text(size=16)) +
+  ggtitle('Annual Growth Increment (log transformed)') +
+  scale_x_discrete(limits = rev(names(labs)[ord]), labels = labs[ord])
+
+#dev.off()
+
+
+
+# plot predicted vs actual height values
+# info on including random effects: https://stats.stackexchange.com/questions/191648/using-re-form-in-predict-mermod-for-a-lmer-model
+
+
+# png(file = paste('results/model_prediction/glmTMB_full_model_actual_vs_predicted_', garden_clim_colname, '_vs_', pheno_colname, '.png', sep = ''),
+#     height = 10,
+#     width = 10,
+#     res = 300,
+#     units = 'in')
+
+par(mar = c(5,4,4,3), mfrow = c(2,2))
+plot_predicted_vs_actual(model_R(mod, re.form = NULL), title = 'overall, with random effects')
+plot_predicted_vs_actual(model_R(mod, re.form = NA), title = 'overall, no random effects')
+plot_predicted_vs_actual(model_R(mod, re.form = NULL, type = 'conditional',), title = 'conditional, with random effects')
+plot_predicted_vs_actual(model_R(mod, re.form = NA, type = 'conditional',), title = 'conditional, no random effects')
+
+
+#dev.off()
+
+# looking at model
+# see ?Anova.glmmTMB
+# anova: https://stats.stackexchange.com/questions/60362/choice-between-type-i-type-ii-or-type-iii-anova
+summary(mod)
+
+
+# create model table (using sjPlot package)
+# on standardizing (from ?tab.model):
+# "Default standardization is done by completely refitting the model on the standardized data. Hence, this approach is equal to standardizing the variables before fitting the model, which is particularly recommended for complex models that include interactions or transformations (e.g., polynomial or spline terms)."
+tab_model(mod, show.std = T, show.aic = T)
+# save
+# tab_model(mod, show.std = T, show.aic = T,
+#           file = paste('results/model_prediction/glmTMB_model_anova_table_', garden_clim_colname, '_vs_', pheno_colname, '.html', sep = ''))
+
+# these produce the same results
+# car::Anova(mod, component = "cond", type = 2)
+# car::Anova(mod, component = "zi", type = 2)
+glmmTMB:::Anova.glmmTMB(mod, component = 'cond', type = 2)
+glmmTMB:::Anova.glmmTMB(mod, component = 'zi', type = 2)
+
+# print fixed and random effects
+fixef(mod)
+#ranef(mod) # skipping this because the RE for each individual prints a lot of text 
+
+# plot random effects
+# plotting together doesn't save well, plot them all separately then combine later
+res <- plot_model(mod, type = 're', 
+                  sort.est = 'sort.all', 
+                  grid = F, 
+                  vline.color = 'black', 
+                  wrap.title = 20, wrap.labels = 20)
+
+plot(res[[3]]) +
+  labs(tag = 'A')
+#ggsave(paste('results/model_prediction/glmTMB_model_randomEffects_garden_', garden_clim_colname, '_vs_', pheno_colname, '.png', sep = ''),
+#             height = 9, width = 8)
+
+plot(res[[2]]) +
+  labs(tag = 'B')
+#ggsave(paste('results/model_prediction/glmTMB_model_randomEffects_block_garden_', garden_clim_colname, '_vs_', pheno_colname, '.png', sep = ''),
+#            height = 9, width = 8)
+
+plot(res[[1]]) +
+  labs(tag = 'C')
+#ggsave(paste('results/model_prediction/glmTMB_model_randomEffects_genotype_', garden_clim_colname, '_vs_', pheno_colname, '.png', sep = ''),
+#             height = 9, width = 8)
+
+plot(res[[4]]) +
+  labs(tag = 'D')
+#ggsave(paste('results/model_prediction/glmTMB_model_randomEffects_year_', garden_clim_colname, '_vs_', pheno_colname, '.png', sep = ''),
+#            height = 9, width = 8)
+
+
+# save individual random effects save as text - too big to easily visualize on plot
+res <- ranef(mod)
+#write.csv(res$cond$indiv, file = paste('results/model_prediction/glmTMB_model_randomEffects_conditional_individual_', garden_clim_colname, '_vs_', pheno_colname, '.csv', sep = ''))
+#write.csv(res$zi$indiv, file = paste('results/model_prediction/glmTMB_model_randomEffects_zero-inflated_individual_', garden_clim_colname, '_vs_', pheno_colname, '.csv', sep = ''))
+
+
+###############
+# plots of residuals
+# do residuals vary by home climate?
+par(mfrow = c(1,1))
+plot(mod$frame$home_clim[1:44], res$cond$genotype$`(Intercept)`)
+
+# plots of residuals
+# distribution
+hist(residuals(mod))
+
+# residuals for each effect
+plot_model(mod, type = 'resid')
+plot_residuals(mod, show.pred = F)
+# residuals vs height
+#plot(pheno[! is.na(pheno)], residuals(mod))
+hist(residuals(mod))
+
+# check model assumptions
+# "Note: For mixed models, the diagnostic plots like linear relationship or check for Homoscedasticity, do not take the uncertainty of random effects into account, but is only based on the fixed effects part of the model."
+# "For linear (mixed) models, plots for multicollinearity-check (Variance Inflation Factors), QQ-plots, checks for normal distribution of residuals and homoscedasticity (constant variance of residuals) are shown. For generalized linear mixed models, returns the QQ-plot for random effects."
+plot_model(mod, type = 'diag')
+
+
+# model fit 
+sjp.poly(mod, poly.term = 'garden_clim', poly.degree = 2)
+
+# visualize effects of factors on growth
+plot_model(mod, type = 'pred', terms = 'pc1')
+plot_model(mod, type = 'pred', terms = 'pc2')
+plot_model(mod, type = 'pred', terms = 'pc3')
+plot_model(mod, type = 'pred', terms = c('pc1', 'pc3'))
+plot_model(mod, type = 'pred', terms = 'home_clim')
+plot_model(mod, type = 'pred', terms = 'home_clim_2')
+plot_model(mod, type = 'pred', terms = c('home_clim', 'garden_clim'))
+
+# correlation of random effects from the conditional and zero-inflated model
+par(mfrow = c(1,1))
+plot(ranef(mod)$cond$garden[,1], ranef(mod)$zi$garden[,1])
+plot(ranef(mod)$cond$genotype[,1], ranef(mod)$zi$genotype[,1])
+
+# plot genetic PCs, colored by species ancestry
+
+par(mfrow = c(1,2))
+# label by transect
+plot(dat$genetic_PC1, dat$genetic_PC3, type = 'n')
+text(dat$genetic_PC1, dat$genetic_PC3, dat$transect, col = dat$color_Pt)
+# label by genotyoe
+plot(dat$genetic_PC1, dat$genetic_PC3, type = 'n')
+text(dat$genetic_PC1, dat$genetic_PC3, dat$Genotype, col = dat$color_Pt)
+
+##########################
+# plot actual vs predicted height for different subsets of data 
+
+# each genotype separately
+# when random effects are included
+# use se.fit = T to get standard errors
+pred <- predict(mod, type = 'response', se.fit = F)
+# un-log-transform
+pred <- exp(pred) - 1
+
+
+genos <- sort(unique(df.scaled$genotype))
+
+# use only data with no NAs (lm removes this automatically)
+noNA <- df.scaled[,c("pheno", "garden_clim", "garden_clim_2", "home_clim", "home_clim_2", "genotype", "garden", "year", "pc1", "pc2", "pc3")]
+noNA <- noNA[complete.cases(noNA),]
+
+par(mfrow = c(4,4))
+genos_r <- rep(NA, length(genos))
+names(genos_r) <- genos
+genos_p <- rep(NA, length(genos))
+names(genos_p) <- genos
+
+for(n in 1:length(genos)){
+  
+  geno <- genos[n]
+  
+  keep <- which(noNA$genotype == geno)
+  
+  if(length(keep) > 0){
+    
+    cortest <- cor.test(noNA$pheno[keep], pred[keep])
+    pval <- round(cortest$p.value, 4)
+    Rval <- round(cortest$estimate, 3)
+    
+    #par(mfrow = c(1,2))
+    plot(noNA$pheno[keep], pred[keep], pch = 16, col = rgb(0,0,0,0.4), 
+         main = paste( 'genotype ', geno, '\n', 'R = ', Rval, '  |  pval = ', pval, sep = ''), 
+         xlab = "Height (actual)", 
+         ylab = "Height (predicted)")
+    abline(0, 1, col = 'red', lty = 2) # 1to1 line
+    abline(lm(pred[keep] ~ noNA$pheno[keep]), col = 'blue') # fit line
+    
+    genos_r[geno] <- Rval
+    genos_p[geno] <- pval
+    
+  }  
+
+}
+
+par(mfrow = c(1,2))
+hist(genos_r)
+hist(genos_r^2)
+
+
+# plot each garden separately
+
+gards <- unique(df.scaled$garden)
+
+par(mfrow = c(4,5))
+gards_r <- rep(NA, length(gards))
+names(gards_r) <- gards
+
+
+for(n in 1:length(gards)){
+  
+  gard <- gards[n]
+  
+  # use only data with no NAs (lm removes this automatically)
+  noNA <- df.scaled[,c("pheno", "garden_clim", "garden_clim_2", "home_clim", "home_clim_2", "genotype", "garden", "year", "pc1", "pc2", "pc3")]
+  noNA <- noNA[complete.cases(noNA),]
+  
+  keep <- which(noNA$garden == gard)
+  
+  if(length(keep) > 0){
+    
+    cortest <- cor.test(noNA$pheno[keep], pred[keep])
+    pval <- round(cortest$p.value, 4)
+    Rval <- round(cortest$estimate, 3)
+    
+    #par(mfrow = c(1,2))
+    plot(noNA$pheno[keep], pred[keep], pch = 16, col = rgb(0,0,0,0.4), 
+         main = paste( 'garden ', gard, '\n', 'R = ', Rval, '  |  pval = ', pval, sep = ''), 
+         xlab = "Height (actual)", 
+         ylab = "Height (predicted)")
+    abline(0, 1, col = 'red', lty = 2) # 1to1 line
+    abline(lm(pred[keep] ~ noNA$pheno[keep]), col = 'blue') # fit line
+    
+    gards_r[gard] <- Rval
+    
+  }  
+
+}
+
+hist(gards_r)
+hist(gards_r^2)
+par(mfrow = c(1,1))
+barplot(gards_r, las = 2)
+
+# Each year separately
+
+years <- unique(df.scaled$year)
+
+par(mfrow = c(1,2))
+years_r <- rep(NA, length(years))
+names(years_r) <- years
+
+for(n in 1:length(years)){
+  
+  year <- years[n]
+  
+  # use only data with no NAs (lm removes this automatically)
+  noNA <- df.scaled[,c("pheno", "garden_clim", "garden_clim_2", "home_clim", "home_clim_2", "genotype", "garden", "year", "pc1", "pc2", "pc3")]
+  noNA <- noNA[complete.cases(noNA),]
+  
+  keep <- which(noNA$year == year)
+  
+  if(length(keep) > 0){
+    
+    cortest <- cor.test(noNA$pheno[keep], pred[keep])
+    pval <- round(cortest$p.value, 4)
+    Rval <- round(cortest$estimate, 3)
+    
+    #par(mfrow = c(1,2))
+    plot(noNA$pheno[keep], pred[keep], pch = 16, col = rgb(0,0,0,0.4), 
+         main = paste( 'Year ', year, '\n', 'R = ', Rval, '  |  pval = ', pval, sep = ''), 
+         xlab = "Height (actual)", 
+         ylab = "Height (predicted)")
+    abline(0, 1, col = 'red', lty = 2) # 1to1 line
+    abline(lm(pred[keep] ~ noNA$pheno[keep]), col = 'blue') # fit line
+    
+    years_r[year] <- Rval
+    
+  }  
+
+}
+
+hist(years_r)
+hist(years_r^2)
+par(mfrow = c(1,1))
+barplot(years_r, las = 2)
+
+# each garden + year separately
+
+gards <- unique(df.scaled$garden)
+
+par(mfrow = c(4,5))
+# gards_r <- rep(NA, length(gards))
+# names(gards_r) <- gards
+
+# nested loop - loop through gardens then years (some gardens not measured in some years)
+for(n in 1:length(gards)){
+  
+  gard <- gards[n]
+  
+  years <- sort(unique(df.scaled[df.scaled$garden == gard, 'year']))
+  
+  for(y in 1:length(years)){
+    
+    year <- years[y]
+    
+    # use only data with no NAs (lm removes this automatically)
+    noNA <- df.scaled[,c("pheno", "garden_clim", "garden_clim_2", "home_clim", "home_clim_2", "genotype", "garden", "year", "pc1", "pc2", "pc3")]
+    noNA <- noNA[complete.cases(noNA),]
+    
+    keep <- which(noNA$garden == gard & noNA$year == year)
+    
+    if(length(keep) > 0){
+      
+      cortest <- cor.test(noNA$pheno[keep], pred[keep])
+      pval <- round(cortest$p.value, 4)
+      Rval <- round(cortest$estimate, 3)
+      
+      #par(mfrow = c(1,2))
+      plot(noNA$pheno[keep], pred[keep], pch = 16, col = rgb(0,0,0,0.4), 
+           main = paste(gard, ' ', year, '\n', 'R = ', Rval, '  |  pval = ', pval, sep = ''), 
+           xlab = "Height (actual)", 
+           ylab = "Height (predicted)")
+      abline(0, 1, col = 'red', lty = 2) # 1to1 line
+      
+      # skip plotting fit line if it can't run the correlation (eg SWMN 2022 are all dead)
+      # I haven't gotten this to work
+      #try(x <- abline(lm(pred[keep] ~ noNA$pheno[keep]), col = 'blue'), silent = T)
+      
+      # gards_r[gard] <- Rval
+      
+    }  
+  }
+}
+
+
+# does ancestry affect how well the model predicts height?
+# might expect hybrids to be less predictable
+r_vs_pt <- data.frame(cor_R = genos_r, cor_pval = genos_p,  Pt = NA, hybrid_index = NA)
+
+r_vs_pt 
+
+
+# get Pt (tricho ancestry)
+for(n in 1:nrow(r_vs_pt)){
+  
+  r_vs_pt[n, 'Pt'] <- dat[match(rownames(r_vs_pt)[n], df$genotype), 'Pt']
+  r_vs_pt[n, 'hybrid_index'] <- dat[match(rownames(r_vs_pt)[n], df$genotype), 'hybrid_index_Pb']
+  
+}
+par(mfrow = c(1,2))
+plot(r_vs_pt$Pt, r_vs_pt$cor_R)
+plot(r_vs_pt$hybrid_index, r_vs_pt$cor_R)
+
+```
+
+# Model validation using subsets
+
+Test model performance using leave-one-out cross-validation: Split data into training/test sets by leaving one garden out, training the model without that garden, then predict for that garden.
+
+## By garden
+
+This section separates models by garden, but not by year - so both years are included in the plots of actual vs predicted values. The MS does not report values from this section, instead reporting years separately as in the next code chunk.
+
+```{r validation_leave_garden_out}
+
+
+# validate model by removing one garden to build model, then testing predictions for that garden
+
+# plot full model for comparison
+plot_model(mod, type = 'std', vline.color = "black", show.values = T) +
+   theme(text=element_text(size=16)) + 
+  ggtitle('Full model')
+
+
+# loop though gardens and leave each out
+# not all of these models converge
+
+gards <- sort(unique(df.scaled$garden))
+
+mods_test <- list()
+
+for(n in 1:length(gards)){
+  
+  gard <- gards[n]
+  
+  # subset
+  df.scaled.sub <- df.scaled[df.scaled$garden != gard,]
+  
+  mods_test[[n]] <- update(mod, data = df.scaled.sub)
+  
+  summary(mods_test[[n]])
+  
+  p <- plot_model(mods_test[[n]], type = 'std', vline.color = "black", show.values = T) +
+    theme(text=element_text(size=16)) + 
+    ggtitle(paste('without', gard))
+  plot(p)
+  
+  
+}
+
+names(mods_test) <- paste('without_', gards, sep = '')
+
+plot_models(mods_test, std.est = 'std', spacing = 0.8, vline.color = "black", show.values = F, p.shape = T, m.labels = names(mods_test), colors = c("#008856",  "#8DB600", "#BE0032", "#875692", "#A1CAF1", "#2B3D26", "#C2B280", "#F3C300", "#848482", "#0067A5", "#E68FAC", "#F99379", "#604E97", "#B3446C", "#DCD300", "#882D17", "#E25822", "#654522"))
+
+
+#ggsave(filename = paste('results/model_prediction/compare_models_leave_one_garden_out_', garden_clim_colname, '_vs_', pheno_colname, '.pdf', sep = ''), device = 'pdf', height = 12, width = 8)
+
+########
+
+# residuals for each sub-model
+#pdf(file = 'results/model_prediction/residuals_density_leave_garden_out.pdf', height = 6, width = 16)
+#plot_resid(mods_test)
+#dev.off()
+
+#########
+# plot predicted vs actual for the full dataset (all gardens) for each model
+
+par(mfrow = c(2,2))
+
+for(n in 1:length(mods_test)){
+  
+  modN <- mods_test[[n]]
+  
+      # overall model
+    plot_predicted_vs_actual(model_R(modN, re.form = NULL), title = names(mods_test)[n])
+    plot_predicted_vs_actual(model_R(modN, re.form = NA), title = 'no random effects')
+    # conditional model (just growth)
+    # with dead trees removed
+    plot_predicted_vs_actual(model_R(modN, re.form = NULL, type = 'conditional'), title = 'conditional')
+    plot_predicted_vs_actual(model_R(modN, re.form = NA, type = 'conditional'), title = 'no random effects')
+  
+}
+
+
+
+##########
+# predict for each garden left out of model
+
+
+# function for predicting with new data - based on model_R() function defined above
+model_R_new <- function(mod, newdata, type = 'response', re.form = NULL, se.fit = FALSE){
+  
+  df <- newdata
+  
+  # make new dataframe with no NA values
+  noNA <- df[complete.cases(df),]
+  
+  # predict phenotype (generally height)
+  noNA$pred <- predict(mod, newdata = noNA, type = type, re.form = re.form, se.fit = se.fit, allow.new.levels=TRUE)
+  
+  # un-log-transform
+  noNA$pred <- exp(noNA$pred) - 1
+  
+  # if type = conditional, remove dead trees (which are modeled separately in zero-inflated model)
+  if(type == 'conditional'){
+    noNA <- noNA[rownames(noNA) %in% alive,]
+  }
+  
+  # calculate correlation
+  cor <- cor.test(noNA$pheno, noNA$pred)
+  
+  return(list(actual = noNA$pheno, predicted = noNA$pred, cor = cor, data_noNAs = noNA))
+  
+}
+
+
+# loop through each model and predict for garden that was left out
+
+# objects to save results to
+pred.overall_REs <- list()
+pred.overall_noREs <- list()
+pred.cond_REs <- list()
+pred.cond_noREs <- list()
+
+par(mfrow = c(2,2))
+for(n in 1:length(gards)){
+  
+  gard <- gards[n]
+  modN <- mods_test[[n]]
+  
+  newdata <- df.scaled[df.scaled$garden == gard,]
+  
+  # plot
+  # overall model
+  
+  pred.overall_REs[[n]] <- model_R_new(modN, newdata =  newdata, re.form = NULL)
+  plot_predicted_vs_actual(pred.overall_REs[[n]], title = paste(names(mods_test)[n], 'overall, with random effects', sep = '\n'))
+  
+  pred.overall_noREs[[n]] <- model_R_new(modN, newdata = newdata, re.form = NA)
+  plot_predicted_vs_actual(pred.overall_noREs[[n]], title = 'overall, no random effects')
+  
+  
+  # conditional model
+  pred.cond_REs[[n]] <- model_R_new(modN, type = 'conditional', newdata =  newdata, re.form = NULL)
+  plot_predicted_vs_actual(pred.cond_REs[[n]], title = 'conditional, with random effects')
+  
+  pred.cond_noREs[[n]] <- model_R_new(modN, type = 'conditional', newdata = newdata, re.form = NA)
+  plot_predicted_vs_actual(pred.cond_noREs[[n]], title = 'conditional, no random effects')
+  
+  
+}
+
+# remove "all" model from names
+model_names <- names(mods_test)[names(mods_test) != 'all']
+names(pred.overall_REs) <- model_names
+names(pred.overall_noREs) <- model_names
+names(pred.cond_REs) <- model_names
+names(pred.cond_noREs) <- model_names
+
+preds.full <- list(pred.overall_REs, pred.overall_noREs, pred.cond_REs, pred.cond_noREs)
+names(preds.full) <- c('overall_REs', 'overall_noREs', 'cond_REs', 'cond_noREs')
+
+# plot panel with just the conditional RE plots
+gard_cols <- c("#008856",  "#8DB600", "#BE0032", "#875692", "#A1CAF1", "#2B3D26", "#C2B280", "#F3C300", "#848482", "#0067A5", "#E68FAC", "#F99379", "#604E97", "#B3446C", "#DCD300", "#882D17", "#E25822", "#654522")
+
+
+#png(filename = paste('results/model_prediction/validation_leaveOneGardenOutAndPredict_', garden_clim_colname, '_vs_', pheno_colname, '.png', sep = ''), height = 7.2, width = 12.8, units = 'in', res = 300)
+
+#pdf(file = paste('results/model_prediction/validation_leaveOneGardenOutAndPredict_', garden_clim_colname, '_vs_', pheno_colname, '.pdf', sep = ''), height = 8, width = 12)
+par(mfrow = c(3,4))
+
+for(n in 1:length(pred.cond_noREs)){
+  
+  gard <- gsub('without_', '', names(pred.cond_noREs)[n])
+  plot_predicted_vs_actual(pred.cond_noREs[[n]], 
+                           title = gard, 
+                           col = gard_cols[n],
+                           col_1to1 = 'grey',
+                           col_fit = gard_cols[n])
+  
+}
+
+#dev.off()
+
+# version ordered by mortality - use mean to get a proportion
+# use as character so it's alphabetical to match 'gard' object
+dead <- aggregate(dat$Survival_09_2021, by = list(as.character(dat$MiniCG_Site)), FUN = mean, na.rm = T)
+
+ord <- order(dead$x, decreasing = T)
+
+# proportion surviving in each garden (NOT proportion dead)
+dead[ord,]
+
+gard.sort <- dead$Group.1[ord]
+
+#pdf(file = paste('results/model_prediction/validation_leaveOneGardenOutAndPredict_sortGardensByMortality', garden_clim_colname, '_vs_', pheno_colname, '.pdf', sep = ''), height = 8, width = 12)
+
+par(mfrow = c(3,4))
+
+for(n in ord){
+  
+  
+  gard <- gards[n]
+  
+  plot_predicted_vs_actual(pred.cond_noREs[[n]], 
+                           title = gard, 
+                           col = gard_cols[n],
+                           col_1to1 = 'grey',
+                           col_fit = gard_cols[n])
+  
+}
+
+
+#dev.off()
+
+# png version for supplement
+
+#png(filename = paste('results/model_prediction/validation_leaveOneGardenOutAndPredict_sortGardensByMortality', garden_clim_colname, '_vs_', pheno_colname, '.png', sep = ''), height = 7.2, width = 12.8, units = 'in', res = 300)
+
+par(mfrow = c(3,6))
+
+for(n in ord){
+  
+  
+  gard <- gards[n]
+  
+  plot_predicted_vs_actual(pred.cond_REs[[n]], 
+                           title = gard, 
+                           col = gard_cols[n],
+                           col_1to1 = 'grey',
+                           col_fit = gard_cols[n],
+                           legend = F)
+  
+}
+
+
+#dev.off()
+
+# get all the R values
+rvals <- as.data.frame(matrix(nrow = length(preds.full$overall_REs), ncol = 4))
+colnames(rvals) <- names(preds.full)
+rownames(rvals) <- names(preds.full$overall_REs)
+
+rvals$overall_REs <- as.numeric(lapply(1:length(preds.full$overall_REs), function(x) preds.full$overall_REs[[x]]$cor$estimate))
+rvals$overall_noREs <- as.numeric(lapply(1:length(preds.full$overall_noREs), function(x) preds.full$overall_noREs[[x]]$cor$estimate))
+rvals$cond_REs <- as.numeric(lapply(1:length(preds.full$cond_REs), function(x) preds.full$cond_REs[[x]]$cor$estimate))
+rvals$cond_noREs <- as.numeric(lapply(1:length(preds.full$cond_noREs), function(x) preds.full$cond_noREs[[x]]$cor$estimate))
+
+rvals
+
+# plots
+par(mfrow = c(2,2))
+# xlim assumes no negative correlations
+hist(rvals$overall_REs, xlim = c(0,1))
+hist(rvals$overall_noREs, xlim = c(0,1))
+hist(rvals$cond_REs, xlim = c(0,1))
+hist(rvals$cond_noREs, xlim = c(0,1))
+
+colMeans(rvals)
+
+rvals[which.max(rvals$cond_REs),]
+rvals[which.min(rvals$cond_REs),]
+
+
+```
+
+
+## By garden + year
+
+Predictions for each garden are made separately for each year, if multiple years of data are available (some gardens were only measured the first year). These are the results reported in the manuscript.
+
+```{r validation_leave_garden_year_out}
+
+# loop through each model and predict for garden that was left out
+# here, predictions are separated by year 
+# so model is trained without a garden, then predictions for that garden are made separately for each year
+# use mods_test object from above chunk, with each garden removed 
+
+gard_cols <- c("#008856",  "#8DB600", "#BE0032", "#875692", "#A1CAF1", "#2B3D26", "#C2B280", "#F3C300", "#848482", "#0067A5", "#E68FAC", "#F99379", "#604E97", "#B3446C", "#DCD300", "#882D17", "#E25822", "#654522")
+
+# objects to save results to
+pred.overall_REs <- list()
+pred.overall_noREs <- list()
+pred.cond_REs <- list()
+pred.cond_noREs <- list()
+
+gards <- sort(unique(df.scaled$garden))
+cols.yr <- vector()
+
+# check that garden names and model names are in the same order
+cbind(gards, names(mods_test))
+
+par(mfrow = c(2,2))
+# counter to keep track of which garden/year we're on
+count <- 1
+for(n in 1:length(gards)){
+  
+  # loop through each garden, use model trained without that garden
+  gard <- gards[n]
+  modN <- mods_test[[n]]
+  
+  # subset data to this garden
+  df.scaled.sub <- df.scaled[df.scaled$garden == gard,]
+  
+  # now loop through each year for this garden
+  years <- sort(unique(df.scaled.sub$year))
+  
+  for(y in 1:length(years)){
+    
+    year <- years[y]
+    
+    # subset data to this year
+    newdata <- df.scaled.sub[df.scaled.sub$year == year,]
+    
+    # plot actual vs predicted for this garden and year, using model trained without this garden
+    
+    # plots
+    # overall model
+    
+    pred.overall_REs[[count]] <- model_R_new(modN, newdata =  newdata, re.form = NULL)
+    plot_predicted_vs_actual(pred.overall_REs[[count]], title = paste(names(mods_test)[n], ', predicted for ', year, '\n', 'overall, with random effects', sep = ''))
+    
+    pred.overall_noREs[[count]] <- model_R_new(modN, newdata = newdata, re.form = NA)
+    plot_predicted_vs_actual(pred.overall_noREs[[count]], title = 'overall, no random effects')
+    
+    
+    # conditional model
+    pred.cond_REs[[count]] <- model_R_new(modN, type = 'conditional', newdata =  newdata, re.form = NULL)
+    plot_predicted_vs_actual(pred.cond_REs[[count]], title = 'conditional, with random effects')
+    
+    pred.cond_noREs[[count]] <- model_R_new(modN, type = 'conditional', newdata = newdata, re.form = NA)
+    plot_predicted_vs_actual(pred.cond_noREs[[count]], title = 'conditional, no random effects')
+    
+    # name output
+    name <- paste(gard, year, sep = '_')
+    names(pred.overall_REs)[[count]] <- name
+    names(pred.overall_noREs)[[count]] <- name
+    names(pred.cond_REs)[[count]] <- name
+    names(pred.cond_noREs)[[count]] <- name
+    
+    # set garden color and save to a vector
+    cols.yr[count] <- gard_cols[n]
+    
+    # set counter
+    count <- count + 1
+  }
+}
+
+
+preds.full <- list(pred.overall_REs, pred.overall_noREs, pred.cond_REs, pred.cond_noREs)
+names(preds.full) <- c('overall_REs', 'overall_noREs', 'cond_REs', 'cond_noREs')
+
+# get yearly averages
+pred.21 <- pred.cond_REs[grep('2021', names(pred.cond_REs))]
+mean(sapply(1:length(pred.21), function(x) mean(pred.21[[x]]$cor$estimate)))
+
+pred.22 <- pred.cond_REs[grep('2022', names(pred.cond_REs))]
+mean(sapply(1:length(pred.22), function(x) mean(pred.22[[x]]$cor$estimate)))
+
+# plot panel with just the conditional RE plots
+
+
+#pdf(file = paste('results/model_prediction/validation_leaveOneGardenOutAndPredictYear_', garden_clim_colname, '_vs_', pheno_colname, '.pdf', sep = ''), height = 8, width = 12)
+par(mfrow = c(3,4))
+
+for(n in 1:length(pred.cond_REs)){
+  
+  
+  title <- names(pred.cond_REs)[n]
+  plot_predicted_vs_actual(pred.cond_REs[[n]], 
+                           title = title, 
+                           col = cols.yr[n],
+                           col_1to1 = 'grey',
+                           col_fit = cols.yr[n],
+                           legend = F)
+  
+}
+
+#dev.off()
+
+#png(filename = paste('results/model_prediction/validation_leaveOneGardenOutAndPredictYear_', garden_clim_colname, '_vs_', pheno_colname, '.png', sep = ''), height = 16, width = 9.6, units = 'in', res = 300)
+
+#par(mfrow = c(8,4))
+par(mfrow = c(4,5))
+
+for(n in 1:length(pred.cond_REs)){
+  
+  
+  title <- names(pred.cond_REs)[n]
+  plot_predicted_vs_actual(pred.cond_REs[[n]], 
+                           title = title, 
+                           col = cols.yr[n],
+                           col_1to1 = 'grey',
+                           col_fit = cols.yr[n],
+                           legend = F)
+  
+}
+
+#dev.off()
+
+# get all the R values
+#hist(as.numeric(lapply(1:length(preds.full$cond_REs), function(x) preds.full$cond_REs[[x]]$cor$estimate)))
+
+
+
+```
+
+# Compare model predictive ability when genetic and home climate information is removed
+
+Test what information is needed to predict each genotype's response to temperature. if home climate can serve as a proxy for locally adaptive genetic variation, including genetic data may not be necessary for predicting growth under future climates.
+
+```{r compare_noClimate_noGenetics}
+
+# Does genetics or home climate give better predictions of fitness?
+# using same method as above, calculate R^2 values when leaving each garden out
+# but compare full model to models with home climate or genetic structure removed
+
+# only climate, no genetics
+
+gards <- unique(df.scaled$garden)
+
+mods_test_no_gen <- list()
+
+for(n in 1:length(gards)){
+  
+  gard <- gards[n]
+  
+  # subset
+  df.scaled.sub <- df.scaled[df.scaled$garden != gard,]
+  
+  # run model
+  mods_test_no_gen[[n]] <-  glmmTMB(log(pheno + 1) ~ garden_clim*home_clim + garden_clim_2*home_clim_2  + garden_clim_2*home_clim + home_clim_2*garden_clim +
+                                      (1 | genotype) + (1 | garden/block) + (1 | year) + (1 | indiv),
+                                    data = df.scaled.sub, 
+                                    family = gaussian(), 
+                                    ziformula = ~.)
+  
+summary(mods_test_no_gen[[n]])
+
+p <- plot_model(mods_test_no_gen[[n]], type = 'std', vline.color = "black", show.values = T) +
+  theme(text=element_text(size=16)) + 
+  ggtitle(paste('without', gard))
+plot(p)
+  
+  
+}
+
+names(mods_test_no_gen) <- paste('without_', gards, sep = '')
+
+# plot together
+
+plot_models(mods_test_no_gen, std.est = 'std', spacing = 0.8, vline.color = "black", show.values = F, p.shape = T, m.labels = names(mods_test), colors = c("#008856",  "#8DB600", "#BE0032", "#875692", "#A1CAF1", "#2B3D26", "#C2B280", "#F3C300", "#848482", "#0067A5", "#E68FAC", "#F99379", "#604E97", "#B3446C", "#DCD300", "#882D17", "#E25822", "#654522"))
+
+#ggsave(filename = paste('results/model_prediction/compare_models_leave_one_garden_out_NO_GENETICS', garden_clim_colname, '_vs_', pheno_colname, '.pdf', sep = ''), device = 'pdf', height = 12, width = 8)
+
+
+# loop through each model and predict for garden that was left out
+
+# objects to save results to
+pred.overall_REs <- list()
+pred.overall_noREs <- list()
+pred.cond_REs <- list()
+pred.cond_noREs <- list()
+
+par(mfrow = c(2,2))
+
+# counter to keep track of which garden/year we're on
+count <- 1
+for(n in 1:length(gards)){
+  
+  # loop through each garden, use model trained without that garden
+  gard <- gards[n]
+  modN <- mods_test_no_gen[[n]]
+  
+  # subset data to this garden
+  df.scaled.sub <- df.scaled[df.scaled$garden == gard,]
+  
+  # now loop through each year for this garden
+  years <- sort(unique(df.scaled.sub$year))
+  
+  for(y in 1:length(years)){
+    
+    year <- years[y]
+    
+    # subset data to this year
+    newdata <- df.scaled.sub[df.scaled.sub$year == year,]
+    
+    # plot actual vs predicted for this garden and year, using model trained without this garden
+    
+    # plots
+    # overall model
+    
+    pred.overall_REs[[count]] <- model_R_new(modN, newdata =  newdata, re.form = NULL)
+    plot_predicted_vs_actual(pred.overall_REs[[count]], title = paste(names(mods_test)[n], ', predicted for ', year, '\n', 'overall, with random effects', sep = ''))
+    
+    pred.overall_noREs[[count]] <- model_R_new(modN, newdata = newdata, re.form = NA)
+    plot_predicted_vs_actual(pred.overall_noREs[[count]], title = 'overall, no random effects')
+    
+    
+    # conditional model
+    pred.cond_REs[[count]] <- model_R_new(modN, type = 'conditional', newdata =  newdata, re.form = NULL)
+    plot_predicted_vs_actual(pred.cond_REs[[count]], title = 'conditional, with random effects')
+    
+    pred.cond_noREs[[count]] <- model_R_new(modN, type = 'conditional', newdata = newdata, re.form = NA)
+    plot_predicted_vs_actual(pred.cond_noREs[[count]], title = 'conditional, no random effects')
+    
+    # name output
+    name <- paste(gard, year, sep = '_')
+    names(pred.overall_REs)[[count]] <- name
+    names(pred.overall_noREs)[[count]] <- name
+    names(pred.cond_REs)[[count]] <- name
+    names(pred.cond_noREs)[[count]] <- name
+    
+    # set garden color and save to a vector
+    #cols.yr[count] <- gard_cols[n]
+    
+    # set counter
+    count <- count + 1
+  }
+}
+
+preds.nogen <- list(pred.overall_REs, pred.overall_noREs, pred.cond_REs, pred.cond_noREs)
+names(preds.nogen) <- c('overall_REs', 'overall_noREs', 'cond_REs', 'cond_noREs')
+
+
+
+# only genetics and garden climate, not home climate
+
+gards <- unique(df.scaled$garden)
+
+mods_test_no_clim <- list()
+
+for(n in 1:length(gards)){
+  
+  gard <- gards[n]
+  
+  # subset
+  df.scaled.sub <- df.scaled[df.scaled$garden != gard,]
+  
+  # run model
+  mods_test_no_clim[[n]] <-  glmmTMB(log(pheno + 1) ~ garden_clim + garden_clim_2  +
+                                       pc1 + pc2 + pc3 + 
+                                       pc1*garden_clim + pc2*garden_clim + pc3*garden_clim + pc1*garden_clim_2 + pc2*garden_clim_2 + pc3*garden_clim_2 +
+                                       (1 | genotype) + (1 | garden/block) + (1 | year) + (1 | indiv),
+                                     data = df.scaled.sub, 
+                                     family = gaussian(), 
+                                     ziformula = ~.)
+  
+  summary(mods_test_no_clim[[n]])
+  
+  p <- plot_model(mods_test_no_clim[[n]], type = 'std', vline.color = "black", show.values = T) +
+    theme(text=element_text(size=16)) + 
+    ggtitle(paste('without', gard))
+  plot(p)
+  
+  
+}
+
+names(mods_test_no_clim) <- paste('without_', gards, sep = '')
+
+# plot together
+
+plot_models(mods_test_no_clim, std.est = 'std', spacing = 0.8, vline.color = "black", show.values = F, p.shape = T, m.labels = names(mods_test), colors = c("#008856",  "#8DB600", "#BE0032", "#875692", "#A1CAF1", "#2B3D26", "#C2B280", "#F3C300", "#848482", "#0067A5", "#E68FAC", "#F99379", "#604E97", "#B3446C", "#DCD300", "#882D17", "#E25822", "#654522"))
+
+#ggsave(filename = paste('results/model_prediction/compare_models_leave_one_garden_out_NO_HOME_CLIMATE', garden_clim_colname, '_vs_', pheno_colname, '.pdf', sep = ''), device = 'pdf', height = 12, width = 8)
+
+
+# loop through each model and predict for garden that was left out
+# this uses the full model, no climate, and no genetics so they can be compared for each run without a garden
+
+# objects to save results to
+pred.overall_REs <- list()
+pred.overall_noREs <- list()
+pred.cond_REs <- list()
+pred.cond_noREs <- list()
+
+par(mfrow = c(2,2))
+# counter to keep track of which garden/year we're on
+count <- 1
+for(n in 1:length(gards)){
+  
+  # loop through each garden, use model trained without that garden
+  gard <- gards[n]
+  modN <- mods_test_no_clim[[n]]
+  
+  # subset data to this garden
+  df.scaled.sub <- df.scaled[df.scaled$garden == gard,]
+  
+  # now loop through each year for this garden
+  years <- sort(unique(df.scaled.sub$year))
+  
+  for(y in 1:length(years)){
+    
+    year <- years[y]
+    
+    # subset data to this year
+    newdata <- df.scaled.sub[df.scaled.sub$year == year,]
+    
+    # plot actual vs predicted for this garden and year, using model trained without this garden
+    
+    # plots
+    # overall model
+    
+    pred.overall_REs[[count]] <- model_R_new(modN, newdata =  newdata, re.form = NULL)
+    plot_predicted_vs_actual(pred.overall_REs[[count]], title = paste(names(mods_test)[n], ', predicted for ', year, '\n', 'overall, with random effects', sep = ''))
+    
+    pred.overall_noREs[[count]] <- model_R_new(modN, newdata = newdata, re.form = NA)
+    plot_predicted_vs_actual(pred.overall_noREs[[count]], title = 'overall, no random effects')
+    
+    
+    # conditional model
+    pred.cond_REs[[count]] <- model_R_new(modN, type = 'conditional', newdata =  newdata, re.form = NULL)
+    plot_predicted_vs_actual(pred.cond_REs[[count]], title = 'conditional, with random effects')
+    
+    pred.cond_noREs[[count]] <- model_R_new(modN, type = 'conditional', newdata = newdata, re.form = NA)
+    plot_predicted_vs_actual(pred.cond_noREs[[count]], title = 'conditional, no random effects')
+    
+    # name output
+    name <- paste(gard, year, sep = '_')
+    names(pred.overall_REs)[[count]] <- name
+    names(pred.overall_noREs)[[count]] <- name
+    names(pred.cond_REs)[[count]] <- name
+    names(pred.cond_noREs)[[count]] <- name
+    
+    # set garden color and save to a vector
+    cols.yr[count] <- gard_cols[n]
+    
+    # set counter
+    count <- count + 1
+  }
+}
+
+preds.noclim <- list(pred.overall_REs, pred.overall_noREs, pred.cond_REs, pred.cond_noREs)
+names(preds.noclim) <- c('overall_REs', 'overall_noREs', 'cond_REs', 'cond_noREs')
+
+###########################
+# compare R values of predictions among all three models
+
+par(mfrow = c(1,3))
+hist(as.numeric(lapply(1:length(preds.full$cond_REs), function(x) preds.full$cond_REs[[x]]$cor$estimate)))
+hist(as.numeric(lapply(1:length(preds.nogen$cond_REs), function(x) preds.nogen$cond_REs[[x]]$cor$estimate)))
+hist(as.numeric(lapply(1:length(preds.noclim$cond_REs), function(x) preds.noclim$cond_REs[[x]]$cor$estimate)))
+
+
+# put all R values into a dataframe, each row being a model with one garden excluded, a column for full/conditional models and with/without random effects
+# I did this in a pretty ugly way, oh well
+
+mods_test_R <- data.frame(matrix(nrow = length(preds.full$overall_noREs)*3, ncol = 1))
+
+colnames(mods_test_R) <- 'model'
+
+mods_test_R$model <- c(
+  rep('full', length(preds.full$cond_REs)),
+  rep('no_genetics', length(preds.nogen$cond_REs)),
+  rep('no_climate', length(preds.noclim$cond_REs))
+)
+
+mods_test_R$test_data <- c(
+  names(preds.full$cond_REs),
+  names(preds.nogen$cond_REs),
+  names(preds.noclim$cond_REs)
+)
+
+# add overall with REs
+mods_test_R$Rval_overall_REs <- c(
+  as.numeric(lapply(1:length(preds.full$overall_REs), function(x) preds.full$overall_REs[[x]]$cor$estimate)),
+  as.numeric(lapply(1:length(preds.nogen$overall_REs), function(x) preds.nogen$overall_REs[[x]]$cor$estimate)),
+  as.numeric(lapply(1:length(preds.noclim$overall_REs), function(x) preds.noclim$overall_REs[[x]]$cor$estimate))
+)
+
+# add overall without REs
+mods_test_R$Rval_overall_noREs <- c(
+  as.numeric(lapply(1:length(preds.full$overall_noREs), function(x) preds.full$overall_noREs[[x]]$cor$estimate)),
+  as.numeric(lapply(1:length(preds.nogen$overall_noREs), function(x) preds.nogen$overall_noREs[[x]]$cor$estimate)),
+  as.numeric(lapply(1:length(preds.noclim$overall_noREs), function(x) preds.noclim$overall_noREs[[x]]$cor$estimate))
+)
+
+# add conditional with REs
+mods_test_R$Rval_cond_REs <- c(
+  as.numeric(lapply(1:length(preds.full$cond_REs), function(x) preds.full$cond_REs[[x]]$cor$estimate)),
+  as.numeric(lapply(1:length(preds.nogen$cond_REs), function(x) preds.nogen$cond_REs[[x]]$cor$estimate)),
+  as.numeric(lapply(1:length(preds.noclim$cond_REs), function(x) preds.noclim$cond_REs[[x]]$cor$estimate))
+)
+
+# add conditional no REs
+mods_test_R$Rval_cond_noREs <- c(
+  as.numeric(lapply(1:length(preds.full$cond_noREs), function(x) preds.full$cond_noREs[[x]]$cor$estimate)),
+  as.numeric(lapply(1:length(preds.nogen$cond_noREs), function(x) preds.nogen$cond_noREs[[x]]$cor$estimate)),
+  as.numeric(lapply(1:length(preds.noclim$cond_noREs), function(x) preds.noclim$cond_noREs[[x]]$cor$estimate))
+)
+
+# add garden and year information for plotting
+mods_test_R$garden <-  sapply(1:nrow(mods_test_R), FUN = function(x) strsplit(mods_test_R$test_data, '_')[[x]][1])
+mods_test_R$year <-  sapply(1:nrow(mods_test_R), FUN = function(x) strsplit(mods_test_R$test_data, '_')[[x]][2])
+
+  
+# calculate averages for each type of R calculated for the full model
+colMeans(mods_test_R[mods_test_R$model == 'full',3:6])
+
+# how many have accuracy >0.5?
+sum(mods_test_R$Rval_cond_noREs[mods_test_R$model == 'full'] >0.5)
+
+# ggplot settings
+theme_set(theme_bw(base_size = 18))
+
+gard_cols <- c("#008856",  "#8DB600", "#BE0032", "#875692", "#A1CAF1", "#2B3D26", "#C2B280", "#F3C300", "#848482", "#0067A5", "#E68FAC", "#F99379", "#604E97", "#B3446C", "#DCD300", "#882D17", "#E25822", "#654522")
+
+# use ggpubr to add pvalues:
+#https://www.r-bloggers.com/2017/06/add-p-values-and-significance-levels-to-ggplots/
+my_comparisons <- combn(unique(mods_test_R$model), 2, simplify = F)
+
+p1 <- ggplot(mods_test_R, aes(x = model, y = Rval_overall_REs))+
+  geom_hline(yintercept = 0) +
+  geom_violin(draw_quantiles = c(0.5)) +
+  scale_color_manual(values = gard_cols, name = 'Garden') +
+  geom_jitter(height = 0, width = 0.1, size = 3, aes(color = garden, shape = year)) +
+  scale_shape_manual(values = c(16,1), name = 'Year') +
+  ylim(-1, 1.2) +
+  ylab('r (Testing dataset)') +
+  ggtitle('Overall model, with random effects') +
+  stat_compare_means(comparisons = my_comparisons, label = 'p.format', method = 'wilcox.test', paired = T)
+plot(p1)
+
+p2 <- 
+  ggplot(mods_test_R, aes(x = model, y = Rval_overall_noREs))+
+  geom_hline(yintercept = 0) +
+  geom_violin(draw_quantiles = c(0.5)) +
+  geom_jitter(height = 0, width = 0.1, size = 3, aes(color = garden, shape = year)) +
+  scale_color_manual(values = gard_cols, name = 'Garden') +
+  scale_shape_manual(values = c(16,1), name = 'Year') +
+  ylim(-1, 1.2) +
+  ylab('r (Testing dataset)') +
+  ggtitle('Overall model, no random effects') +
+  stat_compare_means(comparisons = my_comparisons, label = 'p.format', method = 'wilcox.test', paired = T)
+  
+plot(p2)
+  
+  
+p3 <- ggplot(mods_test_R, aes(x = model, y = Rval_cond_REs))+
+  geom_hline(yintercept = 0) +
+  geom_violin(draw_quantiles = c(0.5)) +
+  geom_jitter(height = 0, width = 0.1, size = 3, aes(color = garden, shape = year)) +
+  scale_color_manual(values = gard_cols, name = 'Garden') +
+  scale_shape_manual(values = c(16,1), name = 'Year') +
+  ylim(-1, 1.2) +
+  ylab('r (Testing dataset)') +
+  ggtitle('Conditional model, with random effects') +
+  stat_compare_means(comparisons = my_comparisons, label = 'p.format', method = 'wilcox.test', paired = T)
+  
+plot(p3)
+
+p4 <- ggplot(mods_test_R, aes(x = model, y = Rval_cond_noREs))+
+  geom_hline(yintercept = 0) +
+  geom_violin(draw_quantiles = c(0.5)) +
+  geom_jitter(height = 0, width = 0.1, size = 3, aes(color = garden, shape = year)) +
+  scale_color_manual(values = gard_cols, name = 'Garden') +
+  scale_shape_manual(values = c(16,1), name = 'Year') +
+  ylim(-1, 1.2) +
+  ylab('r (Testing dataset)') +
+  ggtitle('Conditional model, no random effects') +
+  stat_compare_means(comparisons = my_comparisons, label = 'p.format', method = 'wilcox.test', paired = T)
+plot(p4)
+
+
+wrap_plots(p1, p2, p3, p4)
+# ggsave(filename = paste('results/model_prediction/Rvalues_predictWithoutOneGarden_compareClimateGeneticsModels_', garden_clim_colname, '_vs_', pheno_colname, '.pdf', sep = ''), device = 'pdf', height = 14, width = 16)
+# ggsave(filename = paste('results/model_prediction/Rvalues_predictWithoutOneGarden_compareClimateGeneticsModels_', garden_clim_colname, '_vs_', pheno_colname, '.png', sep = ''), device = 'png', height = 14, width = 16)
+
+# just the cond_noREs plot
+ggplot(mods_test_R, aes(x = model, y = Rval_cond_noREs))+
+  geom_hline(yintercept = 0) +
+  geom_violin(draw_quantiles = c(0.5)) +
+  geom_jitter(height = 0, width = 0.1, size = 3, aes(color = garden, shape = year)) +
+  scale_color_manual(values = gard_cols, name = 'Garden') +
+  scale_shape_manual(values = c(16,1), name = 'Year') +
+  ylim(-1, 1.2) +
+  ylab('r (Testing dataset)') +
+  ggtitle('Conditional model, no random effects') +
+stat_compare_means(comparisons = my_comparisons, label = 'p.signif', method = 'wilcox.test', paired = T)
+# ggsave(filename = paste('results/model_prediction/Rvalues_condNoREs_predictWithoutOneGarden_compareClimateGeneticsModels_', garden_clim_colname, '_vs_', pheno_colname, '.png', sep = ''), device = 'png', height = 6, width = 8)
+
+
+##########
+# just compare 2021
+
+my_comparisons <- combn(unique(mods_test_R$model), 2, simplify = F)
+
+p1 <- ggplot(subset(mods_test_R, year == '2021'), aes(x = model, y = Rval_overall_REs))+
+  geom_hline(yintercept = 0) +
+  geom_violin(draw_quantiles = c(0.5)) +
+  geom_jitter(height = 0, width = 0.1, size = 3, aes(color = garden, shape = year)) +
+  scale_color_manual(values = gard_cols, name = 'Garden') +
+  scale_shape_manual(values = c(16,1), name = 'Year') +
+  ylim(-1, 1.2) +
+  ylab('r (Testing dataset)') +
+  ggtitle('Overall model, with random effects') +
+  stat_compare_means(comparisons = my_comparisons, label = 'p.format', method = 'wilcox.test', paired = T)
+plot(p1)
+
+p2 <- 
+  ggplot(subset(mods_test_R, year == '2021'), aes(x = model, y = Rval_overall_noREs))+
+  geom_hline(yintercept = 0) +
+  geom_violin(draw_quantiles = c(0.5)) +
+  geom_jitter(height = 0, width = 0.1, size = 3, aes(color = garden, shape = year)) +
+  scale_color_manual(values = gard_cols, name = 'Garden') +
+  scale_shape_manual(values = c(16,1), name = 'Year') +
+  ylim(-1, 1.2) +
+  ylab('r (Testing dataset)') +
+  ggtitle('Overall model, no random effects') +
+  stat_compare_means(comparisons = my_comparisons, label = 'p.format', method = 'wilcox.test', paired = T)
+  
+plot(p2)
+  
+  
+p3 <- ggplot(subset(mods_test_R, year == '2021'), aes(x = model, y = Rval_cond_REs))+
+  geom_hline(yintercept = 0) +
+  geom_violin(draw_quantiles = c(0.5)) +
+  geom_jitter(height = 0, width = 0.1, size = 3, aes(color = garden, shape = year)) +
+  scale_color_manual(values = gard_cols, name = 'Garden') +
+  scale_shape_manual(values = c(16,1), name = 'Year') +
+  ylim(-1, 1.2) +
+  ylab('r (Testing dataset)') +
+  ggtitle('Conditional model, with random effects') +
+  stat_compare_means(comparisons = my_comparisons, label = 'p.format', method = 'wilcox.test', paired = T)
+  
+plot(p3)
+
+p4 <- ggplot(subset(mods_test_R, year == '2021'), aes(x = model, y = Rval_cond_noREs))+
+  geom_hline(yintercept = 0) +
+  geom_violin(draw_quantiles = c(0.5)) +
+  geom_jitter(height = 0, width = 0.1, size = 3, aes(color = garden, shape = year)) +
+  scale_color_manual(values = gard_cols, name = 'Garden') +
+  scale_shape_manual(values = c(16,1), name = 'Year') +
+  ylim(-1, 1.2) +
+  ylab('r (Testing dataset)') +
+  ggtitle('Conditional model, no random effects') +
+  stat_compare_means(comparisons = my_comparisons, label = 'p.format', method = 'wilcox.test', paired = T)
+plot(p4)
+
+
+wrap_plots(p1, p2, p3, p4)
+#ggsave(filename = paste('results/model_prediction/Rvalues_predictWithoutOneGarden_compareClimateGeneticsModels2021_', garden_clim_colname, '_vs_', pheno_colname, '.png', sep = ''), device = 'png', height = 14, width = 16)
+
+#####################
+# just compare 2022
+
+my_comparisons <- combn(unique(mods_test_R$model), 2, simplify = F)
+
+p1 <- ggplot(subset(mods_test_R, year == '2022'), aes(x = model, y = Rval_overall_REs))+
+  geom_hline(yintercept = 0) +
+  geom_violin(draw_quantiles = c(0.5)) +
+  geom_jitter(height = 0, width = 0.1, size = 3, aes(color = garden, shape = year)) +
+  scale_color_manual(values = gard_cols, name = 'Garden') +
+  scale_shape_manual(values = c(16,1), name = 'Year') +
+  ylim(-1, 1.1) +
+  ylab('R (Testing dataset)') +
+  ggtitle('Overall model, with random effects') +
+  stat_compare_means(comparisons = my_comparisons, label = 'p.format', method = 'wilcox.test', paired = T)
+plot(p1)
+
+p2 <- 
+  ggplot(subset(mods_test_R, year == '2022'), aes(x = model, y = Rval_overall_noREs))+
+  geom_hline(yintercept = 0) +
+  geom_violin(draw_quantiles = c(0.5)) +
+  geom_jitter(height = 0, width = 0.1, size = 3, aes(color = garden, shape = year)) +
+  scale_color_manual(values = gard_cols, name = 'Garden') +
+  scale_shape_manual(values = c(16,1), name = 'Year') +
+  ylim(-1, 1.2) +
+  ylab('R (Testing dataset)') +
+  ggtitle('Overall model, no random effects') +
+  stat_compare_means(comparisons = my_comparisons, label = 'p.format', method = 'wilcox.test', paired = T)
+  
+plot(p2)
+  
+  
+p3 <- ggplot(subset(mods_test_R, year == '2022'), aes(x = model, y = Rval_cond_REs))+
+  geom_hline(yintercept = 0) +
+  geom_violin(draw_quantiles = c(0.5)) +
+  geom_jitter(height = 0, width = 0.1, size = 3, aes(color = garden, shape = year)) +
+  scale_color_manual(values = gard_cols, name = 'Garden') +
+  scale_shape_manual(values = c(16,1), name = 'Year') +
+  ylim(-1, 1.2) +
+  ylab('R (Testing dataset)') +
+  ggtitle('Conditional model, with random effects') +
+  stat_compare_means(comparisons = my_comparisons, label = 'p.format', method = 'wilcox.test', paired = T)
+  
+plot(p3)
+
+p4 <- ggplot(subset(mods_test_R, year == '2022'), aes(x = model, y = Rval_cond_noREs))+
+  geom_hline(yintercept = 0) +
+  geom_violin(draw_quantiles = c(0.5)) +
+  geom_jitter(height = 0, width = 0.1, size = 3, aes(color = garden, shape = year)) +
+  scale_color_manual(values = gard_cols, name = 'Garden') +
+  scale_shape_manual(values = c(16,1), name = 'Year') +
+  ylim(-1, 1.2) +
+  ylab('R (Testing dataset)') +
+  ggtitle('Conditional model, no random effects') +
+  stat_compare_means(comparisons = my_comparisons, label = 'p.format', method = 'wilcox.test', paired = T)
+plot(p4)
+
+
+wrap_plots(p1, p2, p3, p4)
+
+#ggsave(filename = paste('results/model_prediction/Rvalues_predictWithoutOneGarden_compareClimateGeneticsModels2022_', garden_clim_colname, '_vs_', pheno_colname, '.png', sep = ''), device = 'png', height = 14, width = 16)
+
+########
+
+# run linear model to test significance
+anova(lm(Rval_overall_REs ~ model * year, data = mods_test_R))
+anova(lm(Rval_overall_noREs ~ model*year, data = mods_test_R))
+
+pairwise.t.test(mods_test_R$Rval_overall_noREs, mods_test_R$model)
+anova(lm(Rval_cond_REs ~ model, data = mods_test_R))
+anova(lm(Rval_cond_noREs ~ model, data = mods_test_R))
+pairwise.t.test(mods_test_R$Rval_cond_noREs, mods_test_R$model)
+
+```
+
+# Predicting phenotypes based on model
+
+## Function for predicting the response to climate
+
+```{r predict_functions}
+
+# predict each genotype's response to a vector of climate (MCMT) values
+# garden_clims is a vector
+# can calculate standard error of predictions using se.fit = TRUE - this takes longer to run
+
+predict_genotype <- function(model,
+                             type = 'response', # can also be conditional or zprob
+                             effects,
+                             home_clim,
+                             garden_clims,
+                             se.fit = FALSE){
+  
+  # vector to save predictions and their standard errors
+  pred_height <- vector()
+  pred_se <- vector()
+  
+  
+  # loop through garden climates
+  for(g in 1:length(garden_clims)){
+    
+    home <- home_clim
+    garden <- garden_clims[g]
+    
+    # make newdata to give to predict()
+    new_data <- as.data.frame(cbind(home, garden, home^2, garden^2))
+    colnames(new_data) <- c('home_clim', 'garden_clim', 'home_clim_2', 'garden_clim_2')
+    # add other random or fixed effects
+    for(n in 1:length(effects)){
+      new_data[names(effects[n])] <- effects[n]
+    }
+    
+    # first have to scale new_data to match the scaled data used in model
+    for(v in 1:length(new_data)){
+      var <- names(new_data)[v]
+      
+      # only scale if var exists in scaling_factor - random effects like genotype are not in scaling factor
+      # IF VARIABLES ARE NAMED DIFFERENTLY HERE IN effects AND scaling_factor IT WILL SKIP THEM
+      if(var %in% names(scaling_factor)){
+        new_data[var] <- new_data[var]*scaling_factor[[var]]
+      } else {
+        warning(var, ' does not have a scaling factor, skipping')
+      }
+      
+      
+    }
+    
+    # predict response for this new data
+    pred <- predict(mod,
+                    type = type,
+                    newdata = new_data,
+                    re.form = NA,
+                    allow.new.levels=TRUE,
+                    se.fit = se.fit)
+    
+    if(se.fit == TRUE) {
+      fit <- pred$fit
+      se <- pred$se.fit
+    } else {
+      fit <- pred
+      se <- NA
+    }
+    
+    # back transform from log if we're predicting height
+    # zprob is probability of a zero, so don't transform
+    if(type %in% c('response', 'conditional')){
+      fit <- exp(fit) - 1
+      # if we calculated standard error, transform that too
+      if(se.fit == TRUE){
+        se <- exp(se) - 1
+      }
+    }
+    pred_height[g] <- fit
+    pred_se[g] <- se
+  }
+  # save
+  pred_height_df <- data.frame(garden_clim = garden_clims, predicted_height = pred_height, pred_se = pred_se)
+  
+  return(pred_height_df)
+  
+  # for troubleshooting - also return input data
+  # return(list(predictions = pred_height_df,
+  #             newdata = new_data))
+}
+
+
+```
+
+## Setup
+
+```{r predict_by_genotype_setup}
+
+# get info for each genotype for use in predictions
+geno_info <- as.data.frame(matrix(nrow= length(unique(dat$Genotype)), ncol = 4))
+colnames(geno_info) <- c('pc1', 'pc2', 'pc3', 'home_clim')
+
+rownames(geno_info) <- unique(dat$Genotype)
+
+for(n in 1:nrow(geno_info)){
+  
+  geno <- rownames(geno_info)[n]
+  
+  # get first row with info for this genotype
+  geno_row <- dat[match(geno, dat$Genotype),]
+  
+  geno_info$pc1[n] <- geno_row$genetic_PC1
+  geno_info$pc2[n] <- geno_row$genetic_PC2
+  geno_info$pc3[n] <- geno_row$genetic_PC3
+  geno_info$home_clim[n] <- geno_row[,home_clim_colname]
+  geno_info$Pt[n] <- geno_row$Pt
+  
+}
+
+# remove the ones with missing data
+geno_info <- geno_info[complete.cases(geno_info),]
+
+# how many predictions to make for each genotype? (higher = smoother curves, but takes longer to run)
+n_clims <- 100
+
+############################################################# 
+#overall prediction (incorporating both height and mortality)
+
+
+# range of climate to predict for
+# use range of both gardens and home climates
+pred_clim_min <- range(c(garden_clim, home_clim), na.rm = T)[1]
+pred_clim_max <- range(c(garden_clim, home_clim), na.rm = T)[2]
+
+```
+
+
+## Predict response to climate by genotype
+
+```{r predict_by_genotype, warning = FALSE}
+
+###############################################
+
+# predictions for overall model (incorporating both height and mortality probability - makes predictions for height in cm)
+
+# loop through genotypes and predict genotype-specific responses across the climate gradient (MCMT)
+preds <- list()
+
+par(mfrow = c(3,4))
+
+for(n in 1:nrow(geno_info)){
+  
+  geno <- rownames(geno_info)[n]
+  
+  g.pc1 <- geno_info$pc1[n]
+  g.pc2 <- geno_info$pc2[n]
+  g.pc3 <- geno_info$pc3[n]
+  g.home_clim <- geno_info$home_clim[n]
+  
+  
+  
+  preds[[n]] <- predict_genotype(mod, 
+                                 effects = list(pc1 = g.pc1, 
+                                                pc2 = g.pc2,
+                                                pc3 = g.pc3,
+                                                genotype = geno), 
+                                 home_clim = g.home_clim, 
+                                 garden_clims = seq(pred_clim_min, pred_clim_max, length.out = n_clims),
+                                 se.fit = FALSE)
+  
+  # plot each genotype when done predicting
+  # plot(preds[[n]]$garden_clim, preds[[n]]$predicted_height, main = rownames(geno_info)[n])
+  # # lines for SE
+  # lines(preds[[n]]$garden_clim, preds[[n]]$predicted_height+preds[[n]]$pred_se, col = 'blue')
+  # lines(preds[[n]]$garden_clim, preds[[n]]$predicted_height-preds[[n]]$pred_se, col = 'blue')
+  # 
+  cat(paste('done with', n, '\n'))
+  
+}
+
+names(preds) <- paste('genotype', rownames(geno_info), sep = '_')
+
+  
+######################
+# plot all genotypes on one graph
+
+colf <- colorRamp2(breaks = c(1, 0.5, 0), colors = c('#BCEE68', '#333333', '#1C86EE'))
+
+#png(file = paste('results/model_prediction/predicted_height_by_genotype_overall_response_', clim_label, '.png', sep = ''), height = 8, width = 10, res = 300, units = 'in')
+par(mfrow = c(1,1), cex.lab = 1.5)
+plot(0,0,
+     xlim = c(pred_clim_min, pred_clim_max), 
+     ylim = c(0, ceiling(max(sapply(1:length(preds), function(n) max(preds[[n]]$predicted_height))))), 
+     type = 'n', 
+     xlab = clim_label, 
+     ylab = paste(pheno_label, '(cm)'))
+
+for(n in 1:length(preds)){
+  
+  lines(preds[[n]]$garden_clim, 
+        preds[[n]]$predicted_height, 
+        col = colf(geno_info[n, 'Pt']), 
+        lwd = 2)
+  
+}
+
+
+# plot range of home climates
+#abline(v = range(geno_info$home_clim, na.rm = T), lty = 2)
+points(x = geno_info$home_clim, y = rep(0, nrow(geno_info)))
+# plot range of garden climates
+# abline(v = range(garden_clim, na.rm = T), lty = 1)
+points(x = unique(garden_clim), y = rep(0, length(unique(garden_clim))), pch = '|')
+legend('topright', pch =c('⭘', '|'), legend = c('Home Climate', 'Garden Climate'))
+
+  
+#dev.off()
+
+# plot with transfer distance instead of garden climate
+
+# calculate x axis limits
+xmin <- pred_clim_min - max(dat[,home_clim_colname])
+xmax <- pred_clim_max - min(dat[,home_clim_colname])
+
+#png(file = paste('results/model_prediction/predicted_height_by_genotype_transfer_dist_overall_response_', clim_label, '.png', sep = ''), height = 8, width = 10, res = 300, units = 'in')
+par(mfrow = c(1,1), cex.lab = 1.5)
+plot(0,0,
+     xlim = c(xmin, xmax), 
+     ylim = c(0, ceiling(max(sapply(1:length(preds), function(n) max(preds[[n]]$predicted_height))))), 
+     type = 'n', 
+     xlab = paste(clim_label, 'Transfer Distance'), 
+     ylab = paste(pheno_label, '(cm)'))
+
+abline(v = 0, lty = 1, col = 'grey40')
+
+for(n in 1:length(preds)){
+  
+  lines(preds[[n]]$garden_clim - geno_info$home_clim[n], 
+        preds[[n]]$predicted_height, 
+        col = colf(geno_info[n, 'Pt']), 
+        lwd = 2)
+  
+}
+
+#dev.off()
+
+
+# plot each individual separately, with real data points
+
+# set shape for each year
+shapes <- c(19, 17, 15)
+cols.yr <- c('black', 'blue', 'red')
+
+#pdf(file = paste('results/model_prediction/model_and_data_by_genotype_overall_', garden_clim_colname, '_', pheno_colname, '.pdf', sep = ''), height = 10, width = 12)
+par(mfrow = c(3,4))
+for(n in 1:length(preds)){
+
+  # get genotype
+  geno <- gsub('genotype_', '', names(preds)[n])
+  
+  # get genotype info
+  sub <- df[df$genotype == geno,]
+  
+  # get R and p-value (calculated in model_plots chunk)
+  Rval <- r_vs_pt[geno, 'cor_R']
+  pval <- r_vs_pt[geno, 'cor_pval']
+  
+  plot(sub$garden_clim, sub$pheno, 
+       pch = shapes[as.factor(sub$year)], 
+       col = cols.yr[as.factor(sub$year)],
+       #col = dat[dat$Genotype == geno, 'color_Pt'][1],
+       xlab = paste('Garden', clim_label),
+       ylab = pheno_label)
+  title(main = paste('Genotype ', geno, '\n', 'R = ', Rval, '  |  p = ', pval, sep = ''), adj = 0)
+  
+  lines(preds[[n]]$garden_clim, 
+        preds[[n]]$predicted_height, 
+        col = colf(geno_info[n, 'Pt']), 
+        lwd = 2)
+  
+  # SE lines
+  #   lines(preds[[n]]$garden_clim, preds[[n]]$predicted_height+preds[[n]]$pred_se, col = 'grey')
+  # lines(preds[[n]]$garden_clim, preds[[n]]$predicted_height-preds[[n]]$pred_se, col = 'grey')
+  
+  # line for home climate
+  abline(v = sub$home_clim[1], lty = 2, col = 'grey')
+  
+
+  
+}
+
+# dev.off()
+
+# does each genotype outcompete others at its home site?
+
+#pdf(file = paste('results/model_prediction/model_compare_genotype_performance_at_home_', garden_clim_colname, '_', pheno_colname, '.pdf', sep = ''), height = 10, width = 12)
+#png(file = paste('results/model_prediction/model_compare_genotype_performance_at_home_onePage', garden_clim_colname, '_', pheno_colname, '.png', sep = ''), height = 24, width = 16, units = 'in', res = 600)
+
+#par(mfrow = c(9,5))
+par(mfrow = c(3,4))
+for(n in 1:length(preds)){
+  
+  # get genotype
+  geno <- gsub('genotype_', '', names(preds)[n])
+  
+  # get genotype info
+  sub <- df[df$genotype == geno,]
+  
+  plot(sub$garden_clim, sub$pheno, 
+       type = 'n',
+       #pch = shapes[as.factor(sub$year)], 
+       #col = cols.yr[as.factor(sub$year)],
+       #col = dat[dat$Genotype == geno, 'color_Pt'][1],
+       xlab = paste('Garden', clim_label),
+       ylab = pheno_label,
+       xlim = c(pred_clim_min, pred_clim_max),
+       ylim = c(0, ceiling(max(sapply(1:length(preds), function(n) max(preds[[n]]$predicted_height))))))
+  title(main = paste('Genotype', geno), adj = 0)
+  
+  # line for home climate
+  abline(v = sub$home_clim[1], lty = 2, lwd = 2, col = 'black')
+  
+  # add other genotypes
+  for(g in 1:length(preds)){
+    
+    lines(preds[[g]]$garden_clim, 
+          preds[[g]]$predicted_height, 
+          col = colf(geno_info[g, 'Pt']), 
+          lwd = 1,
+          lty = 2)
+  }
+  
+  # line for this genotype
+  lines(preds[[n]]$garden_clim, 
+        preds[[n]]$predicted_height, 
+        col = colf(geno_info[n, 'Pt']), 
+        lwd = 3)
+  
+  
+}
+
+
+
+#dev.off()
+
+###############################################
+
+# predictions for conditional model (just height)
+
+# loop through and predict
+preds.cond <- list()
+
+par(mfrow = c(3,4))
+for(n in 1:nrow(geno_info)){
+  
+  geno <- rownames(geno_info)[n]
+  
+  g.pc1 <- geno_info$pc1[n]
+  g.pc2 <- geno_info$pc2[n]
+  g.pc3 <- geno_info$pc3[n]
+  g.home_clim <- geno_info$home_clim[n]
+  
+  
+  preds.cond[[n]] <- predict_genotype(mod, 
+                                      type = 'conditional', 
+                                      effects = list(pc1 = g.pc1, 
+                                                     pc2 = g.pc2, 
+                                                     pc3 = g.pc3, 
+                                                     genotype = geno), 
+                                      home_clim = g.home_clim, 
+                                      garden_clims = seq(pred_clim_min, pred_clim_max, length.out = n_clims,
+                                                         se.fit = FALSE))
+  
+  #plot(preds.cond[[n]]$garden_clim, preds.cond[[n]]$predicted_height, main = rownames(geno_info)[n])
+  
+  #cat(paste('done with', n, '\n'))
+  
+}
+
+names(preds.cond) <- paste('genotype', rownames(geno_info), sep = '_')
+
+# plot conditional model
+
+
+#png(file = paste('results/model_prediction/predicted_height_by_genotype_conditional_model_', clim_label, '.png', sep = ''), height = 8, width = 10, res = 300, units = 'in')
+par(mfrow = c(1,1), cex.lab = 1.5)
+
+plot(0,0, xlim = c(pred_clim_min, pred_clim_max), 
+     ylim = c(0, ceiling(max(sapply(1:length(preds.cond), function(n) max(preds.cond[[n]]$predicted_height))))), 
+     type = 'n', 
+     xlab = clim_label,
+     ylab = paste(pheno_label, '(cm)'))
+
+for(n in 1:length(preds.cond)){
+  
+  lines(preds.cond[[n]]$garden_clim, 
+        preds.cond[[n]]$predicted_height, 
+        col = colf(geno_info[n, 'Pt']), 
+        lwd = 2)
+  
+}
+
+# plot range of home climates
+#abline(v = range(geno_info$home_clim, na.rm = T), lty = 2)
+points(x = geno_info$home_clim, y = rep(0, nrow(geno_info)))
+# plot range of garden climates
+#abline(v = range(garden_clim, na.rm = T), lty = 1)
+points(x = unique(garden_clim), y = rep( 0, length(unique(garden_clim))), pch = '|')
+legend('topright', pch =c('⭘', '|'), legend = c('Home Climate', 'Garden Climate'))
+
+ 
+#dev.off()
+
+# plot with transfer distance instead of garden climate
+
+# calculate x axis limits
+xmin <- pred_clim_min - max(dat[,home_clim_colname])
+xmax <- pred_clim_max - min(dat[,home_clim_colname])
+
+#png(file = paste('results/model_prediction/predicted_height_by_genotype_transfer_dist_conditional_model_', clim_label, '.png', sep = ''), height = 8, width = 10, res = 300, units = 'in')
+par(mfrow = c(1,1), cex.lab = 1.5)
+plot(0,0,
+     xlim = c(xmin, xmax), 
+     ylim = c(0,ceiling(max(sapply(1:length(preds.cond), function(n) max(preds.cond[[n]]$predicted_height))))), 
+     type = 'n', 
+     xlab = paste(clim_label, 'Transfer Distance'), 
+     ylab = paste(pheno_label, '(cm)'))
+
+abline(v = 0, col = 'grey40')
+
+for(n in 1:length(preds.cond)){
+  
+  lines(preds[[n]]$garden_clim - geno_info$home_clim[n], 
+        preds.cond[[n]]$predicted_height, 
+        col = colf(geno_info[n, 'Pt']), 
+        lwd = 2)
+  
+}
+
+#dev.off()
+
+
+# each genotype individually
+
+#pdf(file = paste('results/model_prediction/model_and_data_by_genotype_conditional_', garden_clim_colname, '_', pheno_colname, '.pdf', sep = ''), height = 10, width = 12)
+par(mfrow = c(3,4))
+for(n in 1:length(preds)){
+
+  # get genotype
+  geno <- gsub('genotype_', '', names(preds)[n])
+  
+  # get genotype info
+  sub <- df[df$genotype == geno,]
+  
+  # get R and p-value (calculated in model_plots chunk)
+  # Rval <- r_vs_pt[geno, 'cor_R']
+  # pval <- r_vs_pt[geno, 'cor_pval']
+  
+  plot(sub$garden_clim, sub$pheno, 
+       #pch = 16, 
+       col = cols.yr[as.factor(sub$year)],
+       pch = shapes[as.factor(sub$year)],
+       #col = sub$color_Pt,
+       xlab = paste('Garden', clim_label),
+       ylab = pheno_label,
+       main = paste('Genotype', geno))
+  # haven't calculated R and p values for the conditional model yet, so don't plot them
+  #title(main = paste('Genotype ', geno, '\n', 'R = ', Rval, '  |  p = ', pval, sep = ''), adj = 0)
+  
+  lines(preds[[n]]$garden_clim, preds[[n]]$predicted_height, col = colf(geno_info[n, 'Pt']), lwd = 2, lty = 2)
+  lines(preds.cond[[n]]$garden_clim, preds.cond[[n]]$predicted_height, col = colf(geno_info[n, 'Pt']), lwd = 2)
+  
+  # line for home climate
+  abline(v = sub$home_clim[1], lty = 2, col = 'grey')
+  
+}
+
+#dev.off()
+
+
+#############################################
+# predict for zero inflated model (mortality)
+
+# loop through and predict
+preds.zi <- list()
+
+par(mfrow = c(3,4))
+for(n in 1:nrow(geno_info)){
+  
+  geno <- rownames(geno_info)[n]
+  
+  g.pc1 <- geno_info$pc1[n]
+  g.pc2 <- geno_info$pc2[n]
+  g.pc3 <- geno_info$pc3[n]
+  g.home_clim <- geno_info$home_clim[n]
+  
+  preds.zi[[n]] <- predict_genotype(mod, 
+                                    type = 'zprob', 
+                                    effects = list(pc1 = g.pc1, 
+                                                   pc2 = g.pc2, 
+                                                   pc3 = g.pc3, 
+                                                   genotype = geno), 
+                                    home_clim = g.home_clim, 
+                                    garden_clims = seq(pred_clim_min, pred_clim_max, length.out = n_clims),
+                                    se.fit = FALSE)
+  
+  #plot(preds.zi[[n]]$garden_clim, preds.zi[[n]]$predicted_height, main = rownames(geno_info)[n], ylim = c(0,1))
+  
+  #cat(paste('done with', n, '\n'))
+  
+}
+
+names(preds.zi) <- paste('genotype', rownames(geno_info), sep = '_')
+
+# plot zero-inflated model
+
+
+#png(file = paste('results/model_prediction/predicted_height_by_genotype_zero-inflated_', clim_label, '.png', sep = ''), height = 8, width = 10, res = 300, units = 'in')
+par(mfrow = c(1,1), cex.lab = 1.5)
+plot(0,0,
+     xlim = c(pred_clim_min, pred_clim_max), 
+     ylim = c(0,1), 
+     type = 'n', 
+     xlab = clim_label, 
+     ylab = 'Probablility of Mortality')
+
+for(n in 1:length(preds.zi)){
+  
+  lines(preds.zi[[n]]$garden_clim, 
+        preds.zi[[n]]$predicted_height, 
+        col = colf(geno_info[n, 'Pt']), 
+        lwd = 2)
+  
+}
+
+# plot range of home climates
+#abline(v = range(geno_info$home_clim, na.rm = T), lty = 2)
+points(x = geno_info$home_clim, y = rep(0, nrow(geno_info)))
+# plot range of garden climates
+#abline(v = range(garden_clim, na.rm = T), lty = 1)
+points(x = unique(garden_clim), y = rep( 0, length(unique(garden_clim))), pch = '|')
+
+legend('topright', pch =c('⭘', '|'), legend = c('Home Climate', 'Garden Climate'))
+
+ 
+#dev.off()
+
+# plot with transfer distance instead of garden climate
+
+# calculate x axis limits
+xmin <- pred_clim_min - max(dat[,home_clim_colname])
+xmax <- pred_clim_max - min(dat[,home_clim_colname])
+
+#png(file = paste('results/model_prediction/predicted_height_by_genotype_transfer_dist_zi_response_', clim_label, '.png', sep = ''), height = 8, width = 10, res = 300, units = 'in')
+par(mfrow = c(1,1), cex.lab = 1.5)
+plot(0,0,
+     xlim = c(xmin, xmax), 
+     ylim = c(0,1), 
+     type = 'n', 
+     xlab = paste(clim_label, 'Transfer Distance'), 
+     ylab = 'Probability of Mortality')
+
+abline(v = 0, col = 'grey40')
+
+for(n in 1:length(preds.zi)){
+  
+  lines(preds.zi[[n]]$garden_clim - geno_info$home_clim[n], 
+        preds.zi[[n]]$predicted_height, 
+        col = colf(geno_info[n, 'Pt']), 
+        lwd = 2)
+  
+}
+
+#dev.off()
+
+
+#################################
+# calculate optimal climate
+geno_info$optimal_clim <- NA
+for(n in 1:length(preds)){
+  
+  tmp <- preds[[n]]
+  geno_info$optimal_clim[n] <- tmp[which.max(tmp$predicted_height), 'garden_clim']
+  
+}
+
+plot(geno_info$home_clim, geno_info$optimal_clim, col = colf(geno_info$Pt), pch = 16, xlab = 'home climate', ylab = 'predicted optimal climate', cex = 1.5)
+
+plot(geno_info$home_clim, geno_info$optimal_clim, type = 'n', xlab = 'home climate', ylab = 'predicted optimal climate', cex = 1.5)
+text(geno_info$home_clim, geno_info$optimal_clim, labels = rownames(geno_info), col = colf(geno_info$Pt))
+abline(0,1,lty = 2)
+
+# save
+
+#predictions <- list(overall = preds, conditional = preds.cond, zi = preds.zi, genotypes = geno_info)
+#save(predictions, file = paste('results/model_prediction/predictedGrowth_acrossClimates_byGenotype_', garden_clim_colname, '.Rdata', sep = ''))
+
+```
+
+```{r panel_plot}
+
+
+# to skip running the predictions, which take a long time, can load output file from the above chunk
+#load(paste('results/model_prediction/predictedGrowth_acrossClimates_byGenotype_', garden_clim_colname, '.Rdata', sep = ''))
+# preds <- predictions$overall
+# preds.cond <- predictions$conditional
+# preds.zi <- predictions$zi
+
+colf <- colorRamp2(breaks = c(1, 0.5, 0), colors = c('#BCEE68', '#333333', '#1C86EE'))
+
+#png(file = paste('results/model_prediction/predicted_height_by_genotype_panel_', garden_clim_colname, sep = ''), height = 7, width = 10, res = 300, units = 'in')
+
+par(mfrow = c(2,3), cex.lab = 1.5, cex.main = 1.5)
+
+# overall
+plot(0,0,
+     xlim = c(pred_clim_min, pred_clim_max), 
+     ylim = c(0, ceiling(max(sapply(1:length(preds.cond), function(n) max(preds.cond[[n]]$predicted_height))))), 
+     type = 'n', 
+     xlab = paste(clim_label, '(°C)'), 
+     ylab = paste(pheno_label, '(cm)'))
+title('A. Overall model', adj = 0)
+
+for(n in 1:length(preds)){
+  
+  lines(preds[[n]]$garden_clim, 
+        preds[[n]]$predicted_height, 
+        col = colf(geno_info[n, 'Pt']), 
+        lwd = 2)
+  
+}
+
+
+# plot range of home climates
+#abline(v = range(geno_info$home_clim, na.rm = T), lty = 2)
+points(x = geno_info$home_clim, y = rep(0, nrow(geno_info)), pch = '|')
+# plot range of garden climates
+# abline(v = range(garden_clim, na.rm = T), lty = 1)
+points(x = unique(garden_clim), y = rep(0, length(unique(garden_clim))), pch = 1)
+legend('topright', pch =c('|', '⭘'), legend = c('Home Climate', 'Garden Climate'))
+
+  
+
+
+# conditional
+plot(0,0, xlim = c(pred_clim_min, pred_clim_max), 
+     ylim = c(0, ceiling(max(sapply(1:length(preds.cond), function(n) max(preds.cond[[n]]$predicted_height))))),
+     type = 'n', 
+     xlab = paste(clim_label, '(°C)'),
+     ylab = paste(pheno_label, '(cm)'))
+title('B. Conditional model (growth)', adj = 0)
+
+for(n in 1:length(preds.cond)){
+  
+  lines(preds.cond[[n]]$garden_clim, 
+        preds.cond[[n]]$predicted_height, 
+        col = colf(geno_info[n, 'Pt']), 
+        lwd = 2)
+  
+}
+
+# plot range of home climates
+#abline(v = range(geno_info$home_clim, na.rm = T), lty = 2)
+points(x = geno_info$home_clim, y = rep(0, nrow(geno_info)), pch = '|')
+# plot range of garden climates
+# abline(v = range(garden_clim, na.rm = T), lty = 1)
+points(x = unique(garden_clim), y = rep(0, length(unique(garden_clim))), pch = 1)
+
+#legend('topright', pch =c(1, 16), legend = c('Home Climate', 'Garden Climate'))
+
+
+# zi
+plot(0,0,
+     xlim = c(pred_clim_min, pred_clim_max), 
+     ylim = c(0,1), 
+     type = 'n', 
+     xlab = paste(clim_label, '(°C)'), 
+     ylab = 'Probablility of Mortality')
+title('C. Zero-inflated Model (mortality)', adj = 0)
+
+for(n in 1:length(preds.cond)){
+  
+  lines(preds.zi[[n]]$garden_clim, 
+        preds.zi[[n]]$predicted_height, 
+        col = colf(geno_info[n, 'Pt']), 
+        lwd = 2)
+  
+}
+
+# plot range of home climates
+#abline(v = range(geno_info$home_clim, na.rm = T), lty = 2)
+points(x = geno_info$home_clim, y = rep(0, nrow(geno_info)), pch = '|')
+# plot range of garden climates
+# abline(v = range(garden_clim, na.rm = T), lty = 1)
+points(x = unique(garden_clim), y = rep(0, length(unique(garden_clim))), pch = 1)
+
+#legend('topright', pch =c(1, 16), legend = c('Home Climate', 'Garden Climate'))
+
+#################
+
+# plot with transfer distance instead of garden climate
+
+# overall
+# calculate x axis limits
+xmin <- pred_clim_min - max(dat[,home_clim_colname])
+xmax <- pred_clim_max - min(dat[,home_clim_colname])
+
+plot(0,0,
+     xlim = c(xmin, xmax), 
+     ylim = c(0,ceiling(max(sapply(1:length(preds.cond), function(n) max(preds.cond[[n]]$predicted_height))))), 
+     type = 'n', 
+     xlab = paste(clim_label, 'Transfer Distance (°C)'), 
+     ylab = paste(pheno_label, '(cm)'))
+title('D.', adj = 0)
+
+abline(v = 0, lty = 1, col = 'grey40')
+
+for(n in 1:length(preds)){
+  
+  lines(preds[[n]]$garden_clim - geno_info$home_clim[n], 
+        preds[[n]]$predicted_height, 
+        col = colf(geno_info[n, 'Pt']), 
+        lwd = 2)
+  
+}
+
+# plot with transfer distance instead of garden climate
+
+# calculate x axis limits
+xmin <- pred_clim_min - max(dat[,home_clim_colname])
+xmax <- pred_clim_max - min(dat[,home_clim_colname])
+
+
+plot(0,0,
+     xlim = c(xmin, xmax), 
+     ylim = c(0, ceiling(max(sapply(1:length(preds.cond), function(n) max(preds.cond[[n]]$predicted_height))))), 
+     type = 'n', 
+     xlab = paste(clim_label, 'Transfer Distance (°C)'), 
+     ylab = paste(pheno_label, '(cm)'))
+
+title('E.', adj = 0)
+
+abline(v = 0, col = 'grey40')
+
+for(n in 1:length(preds.cond)){
+  
+  lines(preds[[n]]$garden_clim - geno_info$home_clim[n], 
+        preds.cond[[n]]$predicted_height, 
+        col = colf(geno_info[n, 'Pt']), 
+        lwd = 2)
+  
+}
+
+# plot with transfer distance instead of garden climate
+
+# calculate x axis limits
+xmin <- pred_clim_min - max(dat[,home_clim_colname])
+xmax <- pred_clim_max - min(dat[,home_clim_colname])
+
+
+plot(0,0,
+     xlim = c(xmin, xmax), 
+     ylim = c(0,1), 
+     type = 'n', 
+     xlab = paste(clim_label, 'Transfer Distance (°C)'), 
+     ylab = 'Probability of Mortality')
+
+title('F.', adj = 0)
+
+abline(v = 0, col = 'grey40')
+
+for(n in 1:length(preds.zi)){
+  
+  lines(preds.zi[[n]]$garden_clim - geno_info$home_clim[n], 
+        preds.zi[[n]]$predicted_height, 
+        col = colf(geno_info[n, 'Pt']), 
+        lwd = 2)
+  
+}
+
+#dev.off()
+
+```
