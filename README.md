@@ -3,6 +3,8 @@ Code from "Variation in responses to temperature across admixed genotypes of Pop
 
 All scripts are R markdown files.
 
+To recreate an R environment with package versions used here, the the renv.lock file is included in the 'code' directory. See details for using the renv package [here](https://rstudio.github.io/renv/articles/renv.html).
+
 ## climate_PCA_garden_provenance_historic_future.Rmd
 
 PCA of climate data for both provenance sites (including historic and future climates) and garden sites (yearly climates from 2020-2023).
