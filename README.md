@@ -1,6 +1,10 @@
 # popup_poplar_reaction_norms
 Code from "Variation in responses to temperature across admixed genotypes of Populus trichocarpa × P. balsamifera predict geographic shifts in regions where hybrids are favored"
 
+Alayna Mead, Joie R. Beasley-Bennett, Andrew Bleich, Dylan Fischer, Shelby Flint, Julie Golightly, Sara K. Klopf, Mason W. Kulbaba, Jesse R. Lasky, Jared M. LeBoldus, David B. Lowry, Nora Mitchell, Emily Moran, Jason P. Sexton, Kelsey L. Søndreli, Baxter Worthing, Michelle Zavala-Paez, Matthew C. Fitzpatrick, Jason Holliday, Stephen Keller, Jill A. Hamilton
+
+bioRxiv 2025.05.16.654548; doi: https://doi.org/10.1101/2025.05.16.654548 
+
 All scripts are R markdown files.
 
 To recreate an R environment with package versions used here, the the renv.lock file is included in the 'code' directory. See details for using the renv package [here](https://rstudio.github.io/renv/articles/renv.html).
@@ -11,7 +15,7 @@ PCA of climate data for both provenance sites (including historic and future cli
 
 input: data/clean/546_genotypes_provenance_future_historic_climate_with_gardens_long_format.Rda
 
-output: Figure 2B and C
+output: Figure 1B
 
 ## transfer_function_multiyear_linear_mixed_effects_model.Rmd
 
@@ -55,7 +59,7 @@ input:
 
 * results/model_prediction/predictedGrowth_acrossClimates_byGenotype_garden_MCMT_2021-2022.Rdata
 
-output: Figure S11
+output: Figure S14
 
 
 ## map_best_genotype_by_climate.Rmd
@@ -72,6 +76,6 @@ input:
 
 output:
 
-* Figure 6
+* Figure 6, Figure S15
 
 * results/model_prediction/genotypePredictedHeights_byGardenMCMT.Rdata
