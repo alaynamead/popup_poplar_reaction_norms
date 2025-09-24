@@ -168,14 +168,25 @@ plot_predicted_vs_actual <- function(input, title = NULL, col = rgb(0,0,0,0.1), 
   
   pval <- round(input$cor$p.value, 4)
   cor_est <- as.numeric(round(input$cor$estimate, 3))
-  main <- paste(title, '\n', 'R = ', cor_est, ' | p = ', pval, sep = '')
+  
+  # if pval rounds to zero, display as <0.001
+  if(pval == 0){
+    pval <- '<0.001'
+    main <- paste(title, '\n', 'R = ', cor_est, ' | p < 0.001', sep = '')
+  } else {
+    main <- paste(title, '\n', 'R = ', cor_est, ' | p = ', pval, sep = '')
+  }
+  
+  maxVal <- max(c(input$actual, input$predicted), na.rm = T)
   
   plot(input$actual, input$predicted, 
        pch = 16, 
        col = col, 
        xlab = "Height (actual)", 
        ylab = "Height (predicted)",
-       title(main, adj = 0))
+       title(main, adj = 0),
+       xlim = c(0, maxVal),
+       ylim = c(0, maxVal))
   abline(0, 1, col = col_1to1, lty = 2) # 1to1 line
   abline(lm(input$predicted ~ input$actual), col = col_fit) # fit line
   
@@ -188,11 +199,12 @@ plot_predicted_vs_actual <- function(input, title = NULL, col = rgb(0,0,0,0.1), 
 
 #######
 # for plotting actual mortality vs mortality probability - need logistic model
-# this reports the correct statistics but the plot function just uses a linear line - should be changed to a binomial model
-# but this is okay for a quick look
+# combined the two functions used for overall/conditional models into one to pass the p-value directly to the plot
 
-
-model_R_mortality <- function(mod, re.form = NULL, se.fit = TRUE){
+model_plot_R_mortality <- function(mod, re.form = NULL, se.fit = FALSE, # model parameters
+                              title = NULL, # plot parameters
+                              col = rgb(0,0,0,0.1),
+                              col_fit = 'blue'){
   
   # setup
   # include random effects in predictions or set random effects to zero?
@@ -212,43 +224,40 @@ model_R_mortality <- function(mod, re.form = NULL, se.fit = TRUE){
   # predict phenotype - here, probability of mortality
   df$pred <- predict(mod, type = 'zprob', re.form = re.form, se.fit = se.fit)
   
-  # un-log-transform actual height
-  df$pheno <- exp(df$pheno) - 1
-  
   # convert growth increment to binary 0/1
   # if value is not 0, convert to 1
   df$alive <- ifelse(df$pheno == 0, 0, 1)
   
   # logistic model
   mort <- glm(alive ~ pred, family = 'binomial', data = df)
+  mort.info <- summary(mort)
   
-  # this really should be a logistic fit not linear, but using this for now
-  cor <- cor.test(df$alive, df$pred)
+  # combine outputs into list  
+  out <- list(actual = df$alive, predicted = df$pred, cor = cor, data_noNAs = noNA)
   
-  return(list(actual = df$alive, predicted = df$pred, cor = cor, data_noNAs = noNA))
+  # plot
+  pval <-  round(mort.info$coefficients[2,'Pr(>|z|)'], 3)
+  # if pval rounds to zero, display as <0.001
+  if(pval == 0){
+    pval <- '<0.001'
+    main <- paste(title, '\np < 0.001', sep = '')
+  } else {
+    main <- paste(title, '\np = ', pval, sep = '')
+  }
+  
+  # save plot to output
+  out$plot <- ggplot(data = df, aes(x = pred, y = alive,)) +
+  geom_jitter(height = 0.05, width = 0, color = col) +
+  xlab('Probability of Mortality') +
+  ylab('Actual Survival')+
+    ggtitle(main) +
+geom_smooth(method = glm, formula = y ~ x, method.args = list(family = binomial), col = col_fit)
+  
+  return(out)
+  
   
 }
 
-plot_predicted_vs_actual_mortality <- function(input, title = NULL, col = rgb(0,0,0,0.1), col_1to1 = 'red', col_fit = 'blue'){
-  
-  pval <- round(input$cor$p.value, 4)
-  cor_est <- as.numeric(round(input$cor$estimate, 3))
-  main <- paste(title, '\n', 'R = ', cor_est, ' | p = ', pval, sep = '')
-  
-  plot(input$actual, input$predicted, 
-       pch = 16, 
-       col = col, 
-       xlab = "Mortality (actual)", 
-       ylab = "Probability of mortality",
-       title(main, adj = 0))
-  #abline(0, 1, col = col_1to1, lty = 2) # 1to1 line
-  abline(lm(input$predicted ~ input$actual), col = col_fit) # fit line
-  
-  # add text
-  
- # legend('bottomright', fill = c(col_1to1, col_fit), legend = c('1:1 line', 'Best fit'))
-  
-}
 
 # compare the distribution of residuals among multiple models
 plot_resid <- function(mods, ...){
@@ -342,6 +351,8 @@ plot_resid <- function(mods, ...){
   par(mfrow = c(1,1))
   
 }
+
+
 
 ```
 
@@ -579,6 +590,7 @@ plot_model(mods$year_indiv_RE, type = 're',
                   wrap.title = 20, wrap.labels = 20)
 
 
+
 # use genotype as  RE
 # year as FE
 mods$yearFE_indivRE <- glmmTMB(log(pheno + 1) ~ garden_clim*home_clim + garden_clim_2*home_clim_2  + garden_clim_2 * home_clim + home_clim_2* garden_clim 
@@ -601,6 +613,7 @@ plot_model(mods$yearFE_indivRE, type = 'std', vline.color = "black", show.values
 # compare models
 plot_models(mods, std.est = T, vline.color = "black", show.values = F, p.shape = T, m.labels = names(mods))
 
+
 mods.yrs <- list()
 
 
@@ -622,13 +635,19 @@ for(n in 1:length(mods)){
 ```
 
 
-```{r save_outputs}
+```{r save_final_model}
 
-# which model to save?
-mod <- mods$year_indiv_RE
+# which model to save? (year_indiv_RE)
+mod <- glmmTMB(log(pheno + 1) ~ garden_clim*home_clim + garden_clim_2*home_clim_2  + garden_clim_2 * home_clim + home_clim_2* garden_clim +  pc1*garden_clim + pc2*garden_clim + pc3*garden_clim + pc1*garden_clim_2 + pc2*garden_clim_2 + pc3*garden_clim_2 +
+                      (1 | genotype) + (1 | garden/block) +(1 | year) + (1 | indiv),
+               data = df.scaled,
+               family = gaussian(),
+               ziformula = ~.)
 
-save(mod, df.scaled, scaling_factor,
-     file = paste('results/model_prediction/glmTMB_multiyear_model_outputs_', garden_clim_colname, '_vs_', pheno_colname, '.Rda', sep = ''))
+summary(mod)
+
+# save(mod, df.scaled, scaling_factor,
+#      file = paste('results/model_prediction/glmTMB_multiyear_model_outputs_', garden_clim_colname, '_vs_', pheno_colname, '.Rda', sep = ''))
 
 ```
 
@@ -680,7 +699,7 @@ plot_model(mod, type = 'std', vline.color = "black", show.values = T, value.offs
 # info on including random effects: https://stats.stackexchange.com/questions/191648/using-re-form-in-predict-mermod-for-a-lmer-model
 
 
-# png(file = paste('results/model_prediction/glmTMB_full_model_actual_vs_predicted_', garden_clim_colname, '_vs_', pheno_colname, '.png', sep = ''),
+# png(file = paste('results/model_prediction/glmTMB_full_model_actual_vs_predicted_', garden_clim_colname, '_vs_', pheno_colname, '1to1.png', sep = ''),
 #     height = 10,
 #     width = 10,
 #     res = 300,
@@ -692,8 +711,18 @@ plot_predicted_vs_actual(model_R(mod, re.form = NA), title = 'overall, no random
 plot_predicted_vs_actual(model_R(mod, re.form = NULL, type = 'conditional',), title = 'conditional, with random effects')
 plot_predicted_vs_actual(model_R(mod, re.form = NA, type = 'conditional',), title = 'conditional, no random effects')
 
-
 #dev.off()
+
+# TODO surpress text output
+# plot predicted vs actual for mortality
+p1 <- model_plot_R_mortality(mod, re.form = NULL, title = 'With random effects')
+plot(p1$plot)
+#ggsave(filename = paste('results/model_prediction/glmTMB_full_model_zero-inflated_withREs_actual_vs_predicted_', garden_clim_colname, '_vs_', pheno_colname, '.png', sep = ''), height = 5, width = 6)
+p2 <- model_plot_R_mortality(mod, re.form = NA, title = 'No random effects')
+plot(p2$plot)
+#ggsave(filename = paste('results/model_prediction/glmTMB_full_model_zero-inflated_noREs_actual_vs_predicted_', garden_clim_colname, '_vs_', pheno_colname, '.png', sep = ''), height = 5, width = 6)
+
+
 
 # looking at model
 # see ?Anova.glmmTMB
@@ -941,8 +970,6 @@ for(n in 1:length(years)){
 
 }
 
-hist(years_r)
-hist(years_r^2)
 par(mfrow = c(1,1))
 barplot(years_r, las = 2)
 
@@ -1093,6 +1120,21 @@ for(n in 1:length(mods_test)){
   
 }
 
+# plot actual vs predicted survival
+for(n in 1:length(mods_test)){
+  
+  modN <- mods_test[[n]]
+  
+  # plot predicted vs actual for mortality
+  p1 <-  model_plot_R_mortality(modN, re.form = NULL, 
+                                title = paste(names(mods_test)[n], '\n', 'With random effects', sep = ''))
+  
+  p2 <- model_plot_R_mortality(modN, re.form = NA, 
+                               title = paste(names(mods_test)[n], '\n', 'Without random effects', sep = ''))
+  
+  plot(p1$plot + p2$plot)
+  
+}
 
 
 ##########
@@ -1125,6 +1167,60 @@ model_R_new <- function(mod, newdata, type = 'response', re.form = NULL, se.fit 
   
 }
 
+# function for predicting mortality and plotting expected vs observed with new data
+model_plot_R_mortality_new <- function(mod, newdata, re.form = NULL, se.fit = FALSE, # model parameters
+                              title = NULL, # plot parameters
+                              col = rgb(0,0,0,0.1), 
+                              col_fit = 'blue'){
+  
+  # setup
+  # include random effects in predictions or set random effects to zero?
+  # this is the re.form argument in predict()
+  #re.form <- ifelse(include_REs == TRUE, eval(NULL), NA)
+  
+  df <- newdata
+
+  # first column is phenotype
+  colnames(df)[1] <- 'pheno'
+  
+  # make new dataframe with no NA values
+  noNA <- df[complete.cases(df),]
+  
+  # predict phenotype - here, probability of mortality
+  noNA$pred <- predict(mod, newdata = noNA, type = 'zprob', re.form = re.form, se.fit = se.fit)
+  
+  # convert growth increment to binary 0/1
+  # if value is not 0, convert to 1
+  noNA$alive <- ifelse(noNA$pheno == 0, 0, 1)
+  
+  # logistic model
+  mort <- glm(alive ~ pred, family = 'binomial', data = noNA)
+  mort.info <- summary(mort)
+  
+  # combine outputs into list  
+  out <- list(actual = noNA$alive, predicted = noNA$pred, cor = cor, data_noNAs = noNA)
+  
+  # plot
+  pval <-  round(mort.info$coefficients[2,'Pr(>|z|)'], 3)
+  # if pval rounds to zero, display as <0.001
+  if(pval == 0){
+    pval <- '<0.001'
+    main <- paste(title, '\np < 0.001', sep = '')
+  } else {
+    main <- paste(title, '\np = ', pval, sep = '')
+  }
+  
+  # save plot to output
+  out$plot <- ggplot(data = noNA, aes(x = pred, y = alive,)) +
+  geom_jitter(height = 0.05, width = 0, color = col) +
+  xlab('Probability of Mortality') +
+  ylab('Actual Survival')+
+    ggtitle(main) +
+geom_smooth(method = glm, formula = y ~ x, method.args = list(family = binomial), col = col_fit)
+  
+  return(out)
+  
+}
 
 # loop through each model and predict for garden that was left out
 
@@ -1133,6 +1229,8 @@ pred.overall_REs <- list()
 pred.overall_noREs <- list()
 pred.cond_REs <- list()
 pred.cond_noREs <- list()
+pred.zi_REs <- list()
+pred.zi_noREs <- list()
 
 par(mfrow = c(2,2))
 for(n in 1:length(gards)){
@@ -1159,6 +1257,25 @@ for(n in 1:length(gards)){
   pred.cond_noREs[[n]] <- model_R_new(modN, type = 'conditional', newdata = newdata, re.form = NA)
   plot_predicted_vs_actual(pred.cond_noREs[[n]], title = 'conditional, no random effects')
   
+  # zero-inflated model
+  out1 <-  model_plot_R_mortality_new(modN, 
+                                      newdata = newdata, 
+                                      re.form = NULL, 
+                                title = paste(names(mods_test)[n], '\n', 'With random effects', sep = ''))
+  p1 <- out1$plot
+  
+  out2 <- model_plot_R_mortality_new(modN, 
+                                     newdata = newdata, 
+                                     re.form = NA, 
+                               title = paste(names(mods_test)[n], '\n', 'With random effects', sep = ''))
+  p2 <- out2$plot
+  
+  plot(p1 + p2)
+  
+  # save
+  pred.zi_noREs[[n]] <- out1
+  pred.zi_REs[[n]] <- out2
+  
   
 }
 
@@ -1168,18 +1285,26 @@ names(pred.overall_REs) <- model_names
 names(pred.overall_noREs) <- model_names
 names(pred.cond_REs) <- model_names
 names(pred.cond_noREs) <- model_names
+names(pred.zi_REs) <- model_names
+names(pred.zi_noREs) <- model_names
 
+##########################
+# plot actual vs expected heights for each garden in a panel
+
+# combine overall and conditional into a list
+# leave out zreo-inflated because we can't calculate R values for a glm with binomial link
 preds.full <- list(pred.overall_REs, pred.overall_noREs, pred.cond_REs, pred.cond_noREs)
 names(preds.full) <- c('overall_REs', 'overall_noREs', 'cond_REs', 'cond_noREs')
 
 # plot panel with just the conditional RE plots
-gard_cols <- c("#008856",  "#8DB600", "#BE0032", "#875692", "#A1CAF1", "#2B3D26", "#C2B280", "#F3C300", "#848482", "#0067A5", "#E68FAC", "#F99379", "#604E97", "#B3446C", "#DCD300", "#882D17", "#E25822", "#654522")
+gard_cols <- c("#008856",  "#8DB600", "#BE0032", "#875692", "#A1CAF1", "#2B3D26", "#C2B280", "#F3C300", "#848482", "#0067A5", "#E68FAC", "#F99379", "#604E97", "#DCD300",  "#B3446C", "#882D17", "#E25822", "#654522")
 
 
-#png(filename = paste('results/model_prediction/validation_leaveOneGardenOutAndPredict_', garden_clim_colname, '_vs_', pheno_colname, '.png', sep = ''), height = 7.2, width = 12.8, units = 'in', res = 300)
+# png(filename = paste('results/model_prediction/validation_leaveOneGardenOutAndPredict_', garden_clim_colname, '_vs_', pheno_colname, '_1to1axes.png', sep = ''), height = 7.2, width = 12.8, units = 'in', res = 300)
+# par(mfrow = c(3,6))
 
-#pdf(file = paste('results/model_prediction/validation_leaveOneGardenOutAndPredict_', garden_clim_colname, '_vs_', pheno_colname, '.pdf', sep = ''), height = 8, width = 12)
-par(mfrow = c(3,4))
+#pdf(file = paste('results/model_prediction/validation_leaveOneGardenOutAndPredict_', garden_clim_colname, '_vs_', pheno_colname, '_1to1axes.pdf', sep = ''), height = 8, width = 12)
+#par(mfrow = c(3,4))
 
 for(n in 1:length(pred.cond_noREs)){
   
@@ -1188,7 +1313,8 @@ for(n in 1:length(pred.cond_noREs)){
                            title = gard, 
                            col = gard_cols[n],
                            col_1to1 = 'grey',
-                           col_fit = gard_cols[n])
+                           col_fit = gard_cols[n],
+                           legend = F)
   
 }
 
@@ -1205,12 +1331,11 @@ dead[ord,]
 
 gard.sort <- dead$Group.1[ord]
 
-#pdf(file = paste('results/model_prediction/validation_leaveOneGardenOutAndPredict_sortGardensByMortality', garden_clim_colname, '_vs_', pheno_colname, '.pdf', sep = ''), height = 8, width = 12)
+#pdf(file = paste('results/model_prediction/validation_leaveOneGardenOutAndPredict_sortGardensByMortality', garden_clim_colname, '_vs_', pheno_colname, '_1to1axes.pdf', sep = ''), height = 8, width = 12)
 
 par(mfrow = c(3,4))
 
 for(n in ord){
-  
   
   gard <- gards[n]
   
@@ -1218,7 +1343,8 @@ for(n in ord){
                            title = gard, 
                            col = gard_cols[n],
                            col_1to1 = 'grey',
-                           col_fit = gard_cols[n])
+                           col_fit = gard_cols[n],
+                           legend = F)
   
 }
 
@@ -1227,7 +1353,7 @@ for(n in ord){
 
 # png version for supplement
 
-#png(filename = paste('results/model_prediction/validation_leaveOneGardenOutAndPredict_sortGardensByMortality', garden_clim_colname, '_vs_', pheno_colname, '.png', sep = ''), height = 7.2, width = 12.8, units = 'in', res = 300)
+#png(filename = paste('results/model_prediction/validation_leaveOneGardenOutAndPredict_sortGardensByMortality', garden_clim_colname, '_vs_', pheno_colname, '_1to1axes.png', sep = ''), height = 7.2, width = 12.8, units = 'in', res = 300)
 
 par(mfrow = c(3,6))
 
@@ -1247,6 +1373,37 @@ for(n in ord){
 
 
 #dev.off()
+
+# actual vs expected mortality
+# because of the way I set up the functions, have to re-run the models here to change plot parameters
+mort_plots <- list()
+for(n in 1:length(gards)){
+  
+  
+  gard <- gards[n]
+  modN <- mods_test[[n]]
+  
+  newdata <- df.scaled[df.scaled$garden == gard,]
+
+  # zero-inflated model
+  out <-  model_plot_R_mortality_new(modN, 
+                                     newdata = newdata, 
+                                     re.form = NULL, 
+                                     title = gard,
+                                     col = gard_cols[n],
+                                     col_fit = gard_cols[n])
+  p <- out$plot + theme(text=element_text(size=10))
+  #plot(p)
+  
+  mort_plots[[n]] <- p
+  
+}
+
+
+wrap_plots(mort_plots, ncol = 6)
+
+#ggsave(filename = paste('results/model_prediction/validation_leaveOneGardenOutAndPredict_zeroInflated', garden_clim_colname, '_vs_', pheno_colname, '_1to1axes.png', sep = ''), height = 9, width = 16)
+
 
 # get all the R values
 rvals <- as.data.frame(matrix(nrow = length(preds.full$overall_REs), ncol = 4))
@@ -1288,13 +1445,15 @@ Predictions for each garden are made separately for each year, if multiple years
 # so model is trained without a garden, then predictions for that garden are made separately for each year
 # use mods_test object from above chunk, with each garden removed 
 
-gard_cols <- c("#008856",  "#8DB600", "#BE0032", "#875692", "#A1CAF1", "#2B3D26", "#C2B280", "#F3C300", "#848482", "#0067A5", "#E68FAC", "#F99379", "#604E97", "#B3446C", "#DCD300", "#882D17", "#E25822", "#654522")
+gard_cols <- c("#008856",  "#8DB600", "#BE0032", "#875692", "#A1CAF1", "#2B3D26", "#C2B280", "#F3C300", "#848482", "#0067A5", "#E68FAC", "#F99379", "#604E97", "#DCD300",  "#B3446C", "#882D17", "#E25822", "#654522")
 
 # objects to save results to
 pred.overall_REs <- list()
 pred.overall_noREs <- list()
 pred.cond_REs <- list()
 pred.cond_noREs <- list()
+pred.zi_REs <- list()
+pred.zi_noREs <- list()
 
 gards <- sort(unique(df.scaled$garden))
 cols.yr <- vector()
@@ -1343,12 +1502,33 @@ for(n in 1:length(gards)){
     pred.cond_noREs[[count]] <- model_R_new(modN, type = 'conditional', newdata = newdata, re.form = NA)
     plot_predicted_vs_actual(pred.cond_noREs[[count]], title = 'conditional, no random effects')
     
+    # zero-inflated model
+    out1 <-  model_plot_R_mortality_new(modN, 
+                                        newdata = newdata, 
+                                        re.form = NULL, 
+                                        title = paste(names(mods_test)[n], '\n', 'With random effects', sep = ''))
+    p1 <- out1$plot
+    
+    out2 <- model_plot_R_mortality_new(modN, 
+                                       newdata = newdata, 
+                                       re.form = NA, 
+                                       title = paste(names(mods_test)[n], '\n', 'With random effects', sep = ''))
+    p2 <- out2$plot
+    
+    plot(p1 + p2)
+    
+    # save
+    pred.zi_noREs[[count]] <- out1
+    pred.zi_REs[[count]] <- out2
+    
     # name output
     name <- paste(gard, year, sep = '_')
     names(pred.overall_REs)[[count]] <- name
     names(pred.overall_noREs)[[count]] <- name
     names(pred.cond_REs)[[count]] <- name
     names(pred.cond_noREs)[[count]] <- name
+    names(pred.zi_noREs)[[count]] <- name
+    names(pred.zi_REs)[[count]] <- name
     
     # set garden color and save to a vector
     cols.yr[count] <- gard_cols[n]
@@ -1372,7 +1552,7 @@ mean(sapply(1:length(pred.22), function(x) mean(pred.22[[x]]$cor$estimate)))
 # plot panel with just the conditional RE plots
 
 
-#pdf(file = paste('results/model_prediction/validation_leaveOneGardenOutAndPredictYear_', garden_clim_colname, '_vs_', pheno_colname, '.pdf', sep = ''), height = 8, width = 12)
+#pdf(file = paste('results/model_prediction/validation_leaveOneGardenOutAndPredictYear_', garden_clim_colname, '_vs_', pheno_colname, '1to1axes.pdf', sep = ''), height = 8, width = 12)
 par(mfrow = c(3,4))
 
 for(n in 1:length(pred.cond_REs)){
@@ -1390,10 +1570,10 @@ for(n in 1:length(pred.cond_REs)){
 
 #dev.off()
 
-#png(filename = paste('results/model_prediction/validation_leaveOneGardenOutAndPredictYear_', garden_clim_colname, '_vs_', pheno_colname, '.png', sep = ''), height = 16, width = 9.6, units = 'in', res = 300)
+#png(filename = paste('results/model_prediction/validation_leaveOneGardenOutAndPredictYear_', garden_clim_colname, '_vs_', pheno_colname, '1to1axes.png', sep = ''), height = 16, width = 9.6, units = 'in', res = 300)
 
-#par(mfrow = c(8,4))
-par(mfrow = c(4,5))
+#par(mfrow = c(8,4)) # for saving as file
+par(mfrow = c(4,5)) # visualize within R
 
 for(n in 1:length(pred.cond_REs)){
   
@@ -1410,8 +1590,61 @@ for(n in 1:length(pred.cond_REs)){
 
 #dev.off()
 
+# actual vs expected mortality
+# because of the way I set up the functions, have to re-run the models here to change plot parameters
+
+mort_plots <- list()
+count <- 1
+for(n in 1:length(gards)){
+  
+  # loop through each garden, use model trained without that garden
+  gard <- gards[n]
+  modN <- mods_test[[n]]
+  
+  # subset data to this garden
+  df.scaled.sub <- df.scaled[df.scaled$garden == gard,]
+  
+  # now loop through each year for this garden
+  years <- sort(unique(df.scaled.sub$year))
+  
+  for(y in 1:length(years)){
+    
+    year <- years[y]
+    
+    # subset data to this year
+    newdata <- df.scaled.sub[df.scaled.sub$year == year,]
+    
+    # plot actual vs predicted for this garden and year, using model trained without this garden
+   
+    title <- paste(gsub('without_', '', names(mods_test)[n]), ' ', year,  sep = '') 
+    # zero-inflated model
+    out <-  model_plot_R_mortality_new(modN, 
+                                       newdata = newdata, 
+                                       re.form = NULL, 
+                                       title = title,
+                                       col = gard_cols[n],
+                                       col_fit = gard_cols[n])
+    
+    p <- out$plot + theme(text=element_text(size=10))
+    plot(p)
+    mort_plots[[count]] <- p
+    
+
+   
+    # set garden color and save to a vector
+    cols.yr[count] <- gard_cols[n]
+    
+    # set counter
+    count <- count + 1
+  }
+}
+
+wrap_plots(mort_plots, ncol = 4)
+#ggsave(filename = paste('results/model_prediction/validation_zero-inflated_leaveOneGardenOutAndPredictYear_', garden_clim_colname, '_vs_', pheno_colname, '1to1axes.png', sep = ''), height = 20, width = 12)
+
 # get all the R values
-#hist(as.numeric(lapply(1:length(preds.full$cond_REs), function(x) preds.full$cond_REs[[x]]$cor$estimate)))
+par(mfrow = c(1,1))
+hist(as.numeric(lapply(1:length(preds.full$cond_REs), function(x) preds.full$cond_REs[[x]]$cor$estimate)))
 
 
 
