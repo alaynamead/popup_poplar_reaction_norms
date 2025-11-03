@@ -1,13 +1,20 @@
 # popup_poplar_reaction_norms
-Code from "Variation in responses to temperature across admixed genotypes of Populus trichocarpa × P. balsamifera predict geographic shifts in regions where hybrids are favored"
+[![DOI](https://zenodo.org/badge/983616761.svg)](https://doi.org/10.5281/zenodo.17515154)
 
-Alayna Mead, Joie R. Beasley-Bennett, Andrew Bleich, Dylan Fischer, Shelby Flint, Julie Golightly, Sara K. Klopf, Mason W. Kulbaba, Jesse R. Lasky, Jared M. LeBoldus, David B. Lowry, Nora Mitchell, Emily Moran, Jason P. Sexton, Kelsey L. Søndreli, Baxter Worthing, Michelle Zavala-Paez, Matthew C. Fitzpatrick, Jason Holliday, Stephen Keller, Jill A. Hamilton
 
-bioRxiv 2025.05.16.654548; doi: https://doi.org/10.1101/2025.05.16.654548 
+Code from "Variation in responses to temperature in admixed Populus genotypes predicts geographic shifts in regions where hybrids are favored"
+
+Alayna Mead, Joie R. Beasley-Bennett, Andrew Bleich, Dylan Fischer, Shelby Flint, Julie Golightly, Lee Kalcsits, Sara K. Klopf, Mason W. Kulbaba, Jesse R. Lasky, Jared M. LeBoldus, David B. Lowry, Nora Mitchell, Emily Moran, Jason P. Sexton, Kelsey L. Søndreli, Baxter Worthing, Michelle Zavala-Paez, Matthew C. Fitzpatrick, Jason Holliday, Stephen Keller, Jill A. Hamilton
+
+bioRxiv [2025.05.16.654548v2](https://www.biorxiv.org/content/10.1101/2025.05.16.654548v2); doi: [https://doi.org/10.1101/2025.05.16.654548v2](https://doi.org/10.1101/2025.05.16.654548)
 
 All scripts are R markdown files.
 
 To recreate an R environment with package versions used here, the the renv.lock file is included in the 'code' directory. See details for using the renv package [here](https://rstudio.github.io/renv/articles/renv.html).
+
+
+
+
 
 ## climate_PCA_garden_provenance_historic_future.Rmd
 
