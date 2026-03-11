@@ -6,6 +6,8 @@ Code from "Variation in responses to temperature in admixed Populus genotypes pr
 
 Alayna Mead, Joie R. Beasley-Bennett, Andrew Bleich, Dylan Fischer, Shelby Flint, Julie Golightly, Lee Kalcsits, Sara K. Klopf, Mason W. Kulbaba, Jesse R. Lasky, Jared M. LeBoldus, David B. Lowry, Nora Mitchell, Emily Moran, Jason P. Sexton, Kelsey L. Søndreli, Baxter Worthing, Michelle Zavala-Paez, Matthew C. Fitzpatrick, Jason Holliday, Stephen Keller, Jill A. Hamilton
 
+Published in [New Phytologist](https://nph.onlinelibrary.wiley.com/doi/10.1111/nph.70787); doi: [https://doi.org/10.1111/nph.70787](https://doi.org/10.1111/nph.70787)
+
 bioRxiv [2025.05.16.654548v2](https://www.biorxiv.org/content/10.1101/2025.05.16.654548v2); doi: [https://doi.org/10.1101/2025.05.16.654548v2](https://doi.org/10.1101/2025.05.16.654548)
 
 All scripts are R markdown files.
